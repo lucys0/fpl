@@ -101,6 +101,14 @@ Then run the following script:
 This script is responsible for infering scores from the reward model, converting them into the desired format, and finetuning Pi05 using that data.
 
 
+## FPL datasets
+
+Find below the links to the data collected for FPL: 
+- [plate toast](https://huggingface.co/datasets/MarcelTorne/plate_toast_preferences)
+- [put cube in target bowl](https://huggingface.co/datasets/MarcelTorne/put_cube_in_bowl_preferences)
+- [set up table](https://huggingface.co/datasets/MarcelTorne/setup_table_preferences)
+- [fold pants](https://huggingface.co/datasets/MarcelTorne/fold_pants_preferences)
+
 ## Acknowledgements
 The development of this project, largely benefitted and directly used the following repositories:
 - [openpi](https://github.com/Physical-Intelligence/openpi/tree/main) for finetuning the real world policies and open source weights of Pi05.
