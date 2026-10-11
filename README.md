@@ -16,6 +16,14 @@ conda env create -f conda_environment.yaml
 conda activate robodiff
 
 ```
+Or with [uv](https://docs.astral.sh/uv/), which installs the same pinned versions from `diffusion_policy/pyproject.toml`:
+```bash
+cd diffusion_policy
+uv sync
+source .venv/bin/activate
+```
+mujoco-py needs the MuJoCo 2.1 binaries in `~/.mujoco/mujoco210` (or wherever `MUJOCO_PY_MUJOCO_PATH` points), with their `bin/` directory on `LD_LIBRARY_PATH`.
+
 Export your WandB API Key
 ```bash
 export WANDB_API_KEY=your_key_here  # get it from https://wandb.ai/settings
