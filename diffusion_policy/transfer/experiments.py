@@ -676,5 +676,23 @@ def x5(seeds, methods):
     write_manifest(f"x5_s{seeds.replace(',', '')}", jobs)
 
 
+@cli.command()
+@click.option('--name', required=True, help='stage name: jobs go to runs/<name>/<label>_s<seed>')
+@click.option('--ckpt', 'ckpts', multiple=True, required=True, help='label=checkpoint path with {s} for the seed')
+@click.option('--seeds', default='0,1,2')
+@click.option('--pegs', default=X_PEGS)
+@click.option('--n', default=EVAL_N)
+def record(name, ckpts, seeds, pegs, n):
+    """Recorded evaluation rollouts (same start states as the evaluations) for trajectory analysis."""
+    jobs = []
+    for s in map(int, seeds.split(',')):
+        for kv in ckpts:
+            label, path = kv.split('=', 1)
+            job = Job(f'{name}/{label}_s{s}')
+            job.rollout('rollouts', path.format(s=s), pegs, n, EVAL_SEED, record=True, nut_range=None)
+            jobs.append(job.write())
+    write_manifest(f"{name}_s{seeds.replace(',', '')}", jobs)
+
+
 if __name__ == '__main__':
     cli()
