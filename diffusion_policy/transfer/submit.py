@@ -67,7 +67,8 @@ def snapshot_code():
 @click.option('--hi', default=0, type=int, help='How many jobs (in manifest order) go to iris-hi')
 @click.option('--release_held', is_flag=True, help='Exclude recorded bad nodes from held jobs and release them')
 @click.option('--after', default='', help='Comma-separated Slurm job ids every submitted job also waits for (afterok)')
-def main(manifest, hi, release_held, after):
+@click.option('--cpus', default=None, type=int, help='Override CPUs per job (default 32), e.g. 64 for 60 PPO envs')
+def main(manifest, hi, release_held, after, cpus):
     if release_held:
         out = subprocess.run(['squeue', '-u', os.environ['USER'], '-h', '-t', 'PD', '-o', '%i|%r|%o'],
                              capture_output=True, text=True).stdout
@@ -97,6 +98,8 @@ def main(manifest, hi, release_held, after):
                '-o', f"{job['dir']}/slurm-%j.out"]
         if deps:
             cmd.append('--dependency=afterok:' + ':'.join(deps))
+        if cpus:
+            cmd += [f'--cpus-per-task={cpus}', f'--mem={2 * cpus}G']
         jobid = subprocess.run(cmd + [wrapper, job['dir']], capture_output=True, text=True, check=True).stdout.strip()
         ids[job['name']] = jobid
         submitted += 1

@@ -42,9 +42,9 @@ class Actor:
     """Noisy Euler sampling of the flow model and the log-probabilities of its chain."""
 
     def __init__(self, policy, sigma, noise_steps):
-        """noise_steps: [start, end) of the integration steps followed by noise. Noise on the
-        early steps is partly undone by the deterministic later ones; noise on the last
-        steps lands directly on the executed action."""
+        """noise_steps: [start, end) of the integration steps followed by noise. Use all of
+        them: the network is shared across steps, so updates also change any deterministic
+        steps, outside the PPO ratio (noise on steps 0-5 only collapsed the policy)."""
         self.policy, self.model = policy, policy.model
         self.K = policy.num_inference_steps
         self.dt = -1.0 / self.K
@@ -188,8 +188,10 @@ def main(spec_path):
                 with torch.no_grad():
                     kls.append(((ratio - 1) - log_ratio).mean().item())
                     clipfrac.append(((ratio - 1).abs() > clip).float().mean().item())
-            if np.mean(kls[-max(1, n // mb):]) > spec.get('target_kl', 0.05):
-                stop = True
+                if kls[-1] > spec.get('target_kl', 0.05):     # stop this iteration's updates early
+                    stop = True
+                    break
+            if stop:
                 break
         hist.append(success.mean())
         log(f"iter {it} episodes {episodes_done}: train success {success.mean():.2f} "

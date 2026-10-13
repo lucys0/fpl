@@ -6,7 +6,8 @@ two-peg transfer experiments. One JSON spec per run:
    "method": "bc" | "awr" | "udrl",          # SFT and filtered BC are both "bc"
    "udrl_mode": "scalar" | "axes",           # udrl only
    "data": [{"path": ..., "pegs": ["left"], "max_per_peg": null, "first_n": null,
-             "success_only": false, "rng_seed": 0}, ...],
+             "success_only": false, "rng_seed": 0, "replay": false}, ...],
+   "replay_frac": 0.5,                       # share of training steps from "replay" data (repeated to reach it)
    "steps": 20000, "lr": 2e-4, "warmup": 500, "batch_size": 1024, "seed": 0,
    "awr": {"gamma": 0.99, "beta": 1.0, "max_weight": 20.0},
    "wandb": {"project": ..., "group": ..., "name": ...}}
@@ -18,6 +19,7 @@ import copy
 import json
 import os
 import random
+import shutil
 import sys
 import time
 
@@ -34,7 +36,8 @@ from transfer.common import (GOAL_DIM, MAX_STEPS, EpisodeDataset, build_policy, 
 
 
 def select_episodes(data_specs):
-    """first_n is applied before success_only, so smaller budgets are prefixes of larger ones."""
+    """first_n is applied before success_only, so smaller budgets are prefixes of larger ones.
+    Episodes from specs marked "replay" carry attrs['replay'] = True."""
     episodes = []
     for spec in data_specs:
         eps = load_episodes(spec['path'], pegs=spec.get('pegs'), max_per_peg=spec.get('max_per_peg'),
@@ -43,8 +46,23 @@ def select_episodes(data_specs):
             eps = eps[:spec['first_n']]
         if spec.get('success_only'):
             eps = [e for e in eps if e['attrs']['success']]
+        for e in eps:
+            e['attrs']['replay'] = bool(spec.get('replay', False))
         episodes += eps
     return episodes
+
+
+def mix_replay(episodes, weights, frac, log):
+    """Repeat the replay episodes so they make up about `frac` of all training steps."""
+    new = [i for i, e in enumerate(episodes) if not e['attrs']['replay']]
+    old = [i for i, e in enumerate(episodes) if e['attrs']['replay']]
+    if not old or not new:
+        return episodes, weights
+    steps = lambda idx: sum(len(episodes[i]['action']) for i in idx)
+    reps = max(1, round(frac / (1 - frac) * steps(new) / steps(old)))
+    order = new + old * reps
+    log(f"replay: {len(old)} episodes x{reps} -> {reps * steps(old) / (reps * steps(old) + steps(new)):.0%} of steps")
+    return [episodes[i] for i in order], (None if weights is None else [weights[i] for i in order])
 
 
 # ---------------------------------------------------------------- AWR
@@ -124,6 +142,13 @@ def main(spec_path):
         f"{sum(len(e['action']) for e in episodes)} steps, pegs "
         f"{dict(zip(*np.unique([e['attrs']['target_peg'] for e in episodes], return_counts=True)))}")
 
+    if not episodes:
+        # e.g. filtered BC when no rollout succeeded: nothing to learn from, so the policy stays as it was
+        assert spec.get('init_ckpt'), 'training from scratch needs data'
+        shutil.copy(spec['init_ckpt'], os.path.join(out_dir, 'final.ckpt'))
+        log(f"no training data; final.ckpt = unchanged copy of {spec['init_ckpt']}")
+        return
+
     extra_dim, cond_fn, info = 0, None, {'spec': spec}
     if method == 'udrl':
         mode = spec['udrl_mode']
@@ -143,7 +168,10 @@ def main(spec_path):
     weights = None
     if method == 'awr':
         a = spec.get('awr', {})
-        weights = awr_weights(episodes, a.get('gamma', 0.99), a.get('beta', 1.0), a.get('max_weight', 20.0), device, log)
+        rollouts = [e for e in episodes if not e['attrs']['replay']]
+        w = iter(awr_weights(rollouts, a.get('gamma', 0.99), a.get('beta', 1.0), a.get('max_weight', 20.0), device, log))
+        weights = [np.ones(len(e['action']), dtype=np.float32) if e['attrs']['replay'] else next(w) for e in episodes]
+    episodes, weights = mix_replay(episodes, weights, spec.get('replay_frac', 0.5), log)
 
     dataset = EpisodeDataset(episodes, cond_fn=cond_fn, weights=weights)
     if not spec.get('init_ckpt'):

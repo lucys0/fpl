@@ -36,13 +36,16 @@ ADAPT_M = 200               # B rollouts collected for that
 BUDGETS = (200, 1000)       # episodes of task A per method
 METHODS = ('sft', 'filtered_bc', 'awr', 'udrl_scalar', 'udrl_axes')
 
-ONLINE_BUDGETS = (200, 1000, 3000)   # episodes of task A collected online
+ONLINE_BUDGETS = (200, 1000, 3000)   # episodes of task A collected online (iterated methods)
+PPO_BUDGETS = (200, 1000, 3000, 6000)  # PPO is evaluated further out; 1000 episodes did not move it
 ROUND_EPISODES = 200                 # per round of the iterated supervised methods
 ROUND_STEPS = 2000                   # gradient steps per round
-# noise on the early integration steps barely changes the base policy's success (sigma 0.1: 0.52,
-# 0.2: 0.48 vs 0.50 deterministic), while noise on the last steps lands on the action (0.05: 0.00)
-PPO_SPEC = {'sigma': 0.2, 'noise_steps': [0, 6], 'lr': 1e-5, 'critic_lr': 1e-3, 'epochs': 5,
-            'minibatch': 256, 'clip': 0.1, 'gamma': 0.99, 'lam': 0.95, 'target_kl': 0.05, 'n_envs': 30}
+# Noise must cover every integration step: the network is shared across steps, and with noise on
+# steps 0-5 only, updates changed the deterministic steps outside the PPO ratio and the policy collapsed.
+# Small sigma keeps the base policy intact (0.02 on all steps: 0.40 success vs 0.50 deterministic) but
+# makes ratios sensitive, hence the small learning rate.
+PPO_SPEC = {'sigma': 0.02, 'noise_steps': [0, 10], 'lr': 1e-6, 'critic_lr': 1e-3, 'epochs': 5,
+            'minibatch': 256, 'clip': 0.1, 'gamma': 0.99, 'lam': 0.95, 'target_kl': 0.05, 'n_envs': 60}
 
 
 class Job:
@@ -134,7 +137,8 @@ def e0_wide(ks, seeds):
 @click.option('--base_k', required=True, type=int)
 @click.option('--seeds', default='0,1,2')
 @click.option('--methods', default=','.join(METHODS))
-def e1(base_k, seeds, methods):
+@click.option('--replay', is_flag=True, help='Mix the base policy\'s pretraining demos into post-training (50% of steps)')
+def e1(base_k, seeds, methods, replay):
     """Post-train each base policy on task A only, then evaluate A, B, and how fast B is learned.
 
     One job per (seed, method) runs both budgets. The base policy's A rollouts
@@ -142,9 +146,29 @@ def e1(base_k, seeds, methods):
     small job the others wait for; smaller budgets are prefixes of larger ones.
     """
     jobs = []
+    stage = 'e1r' if replay else 'e1'
     for s in map(int, seeds.split(',')):
         base = f'{RUNS}/e0/base_k{base_k}_s{s}/base/final.ckpt'
-        prefix = f'e1/k{base_k}_s{s}'
+        replay_data = ([{**d, 'replay': True} for d in base_spec(base_k, s)['data']] if replay else [])
+        if replay:
+            # the replay variant reuses the no-replay stage's base rollouts, evals, adaptation and ceiling
+            arollouts = f'{RUNS}/e1/k{base_k}_s{s}/arollouts/arollouts.hdf5'
+            rollouts_job = f'e1-k{base_k}_s{s}-arollouts'
+            prefix = f'{stage}/k{base_k}_s{s}'
+            for m in methods.split(','):
+                job = Job(f'{prefix}/{m}', after=[] if m == 'sft' else [rollouts_job])
+                for n in BUDGETS:
+                    common = {'init_ckpt': base, 'seed': s, 'steps': POST_STEPS, 'lr': 1e-4, 'warmup': 200,
+                              'batch_size': 1024, 'replay_frac': 0.5}
+                    job_spec = method_spec(m, n, arollouts, common)
+                    job_spec['data'] = job_spec['data'] + replay_data
+                    ckpt = job.train(f'n{n}', job_spec)
+                    job.rollout(f'n{n}_eval', ckpt, 'left,right', EVAL_N, EVAL_SEED)
+                    if not m.startswith('udrl'):
+                        add_adapt_b(job, f'n{n}', ckpt, s)
+                jobs.append(job.write())
+            continue
+        prefix = f'{stage}/k{base_k}_s{s}'
         job = Job(f'{prefix}/arollouts')
         job.rollout('base_eval', base, 'left,right', EVAL_N, EVAL_SEED)
         arollouts = job.rollout('arollouts', base, 'left', max(BUDGETS), 1_000_000 + 10_000 * s, record=True)
@@ -164,23 +188,25 @@ def e1(base_k, seeds, methods):
             job = Job(f'{prefix}/{m}', after=[] if m == 'sft' else [rollouts_job])
             for n in BUDGETS:
                 common = {'init_ckpt': base, 'seed': s, 'steps': POST_STEPS, 'lr': 1e-4, 'warmup': 200, 'batch_size': 1024}
-                if m == 'sft':
-                    spec = {**common, 'method': 'bc', 'data': [{'path': f'{DATA}/sft_left_wide.hdf5', 'first_n': n}]}
-                elif m == 'filtered_bc':
-                    spec = {**common, 'method': 'bc', 'data': [{'path': arollouts, 'first_n': n, 'success_only': True}]}
-                elif m == 'awr':
-                    spec = {**common, 'method': 'awr', 'data': [{'path': arollouts, 'first_n': n}]}
-                else:
-                    spec = {**common, 'method': 'udrl', 'udrl_mode': m.split('_')[1],
-                            'data': [{'path': arollouts, 'first_n': n}]}
-                ckpt = job.train(f'n{n}', spec)
+                ckpt = job.train(f'n{n}', method_spec(m, n, arollouts, common))
                 job.rollout(f'n{n}_eval', ckpt, 'left,right', EVAL_N, EVAL_SEED)
                 if not m.startswith('udrl'):      # adapting a return-conditioned policy needs its own recipe
                     add_adapt_b(job, f'n{n}', ckpt, s)
             jobs.append(job.write())
     # rollout-collection jobs gate the others, so they go first (and get iris-hi slots)
     jobs.sort(key=lambda j: not j['name'].endswith('arollouts'))
-    write_manifest(f"e1_k{base_k}_s{seeds.replace(',', '')}", jobs)
+    write_manifest(f"{stage}_k{base_k}_s{seeds.replace(',', '')}", jobs)
+
+
+def method_spec(m, n, arollouts, common):
+    """Post-training spec on task A for method m with a budget of n episodes."""
+    if m == 'sft':
+        return {**common, 'method': 'bc', 'data': [{'path': f'{DATA}/sft_left_wide.hdf5', 'first_n': n}]}
+    if m == 'filtered_bc':
+        return {**common, 'method': 'bc', 'data': [{'path': arollouts, 'first_n': n, 'success_only': True}]}
+    if m == 'awr':
+        return {**common, 'method': 'awr', 'data': [{'path': arollouts, 'first_n': n}]}
+    return {**common, 'method': 'udrl', 'udrl_mode': m.split('_')[1], 'data': [{'path': arollouts, 'first_n': n}]}
 
 
 @cli.command()
@@ -189,7 +215,8 @@ def e1(base_k, seeds, methods):
 @click.option('--methods', default='ppo,filtered_bc_iter,awr_iter')
 @click.option('--ppo_spec', default='{}', help='JSON overrides of PPO_SPEC')
 @click.option('--tag', default='', help='Suffix for the job directories (e.g. for a PPO sweep)')
-def e2(base_k, seeds, methods, ppo_spec, tag):
+@click.option('--replay', is_flag=True, help='Iterated methods also train on the pretraining demos (50% of steps)')
+def e2(base_k, seeds, methods, ppo_spec, tag, replay):
     """Online post-training on A with matched episode budgets: PPO vs filtered BC / AWR in rounds.
 
     The iterated methods collect ROUND_EPISODES with the current policy, fine-tune it on
@@ -197,17 +224,19 @@ def e2(base_k, seeds, methods, ppo_spec, tag):
     checkpoint at an ONLINE_BUDGETS episode count is evaluated on A and B and adapted to B.
     """
     jobs = []
+    stage = 'e2r' if replay else 'e2'
     for s in map(int, seeds.split(',')):
         base = f'{RUNS}/e0/base_k{base_k}_s{s}/base/final.ckpt'
+        replay_data = [{**d, 'replay': True} for d in base_spec(base_k, s)['data']] if replay else []
         for m in methods.split(','):
-            job = Job(f'e2/k{base_k}_s{s}/{m}{tag}')
+            job = Job(f'{stage}/k{base_k}_s{s}/{m}{tag}')
             if m == 'ppo':
                 spec = {**PPO_SPEC, **json.loads(ppo_spec), 'init_ckpt': base, 'peg': 'left', 'seed': s,
-                        'episodes': max(ONLINE_BUDGETS), 'save_at': list(ONLINE_BUDGETS), 'env_meta_from': ENV_META,
+                        'episodes': max(PPO_BUDGETS), 'save_at': list(PPO_BUDGETS), 'env_meta_from': ENV_META,
                         'nut_range': json.loads(WIDE), 'out_dir': f'{job.dir}/ppo'}
                 json.dump(spec, open(f'{job.dir}/ppo.json', 'w'), indent=1)
-                job.lines.append(f'[ -f {job.dir}/ppo/ppo_ep{max(ONLINE_BUDGETS)}.ckpt ] || python -m transfer.ppo {job.dir}/ppo.json')
-                ckpts = {n: f'{job.dir}/ppo/ppo_ep{n}.ckpt' for n in ONLINE_BUDGETS}
+                job.lines.append(f'[ -f {job.dir}/ppo/ppo_ep{max(PPO_BUDGETS)}.ckpt ] || python -m transfer.ppo {job.dir}/ppo.json')
+                ckpts = {n: f'{job.dir}/ppo/ppo_ep{n}.ckpt' for n in PPO_BUDGETS}
             else:
                 method = 'bc' if m.startswith('filtered_bc') else 'awr'
                 prev, data, ckpts = base, [], {}
@@ -216,14 +245,15 @@ def e2(base_k, seeds, methods, ppo_spec, tag):
                                       3_000_000 + 100_000 * s + ROUND_EPISODES * r, record=True)
                     data.append({'path': rec, 'success_only': method == 'bc'})
                     prev = job.train(f'r{r}', {'method': method, 'init_ckpt': prev, 'seed': s, 'steps': ROUND_STEPS,
-                                               'lr': 1e-4, 'warmup': 100, 'batch_size': 1024, 'data': list(data)})
+                                               'lr': 1e-4, 'warmup': 100, 'batch_size': 1024, 'replay_frac': 0.5,
+                                               'data': list(data) + replay_data})
                     if (r + 1) * ROUND_EPISODES in ONLINE_BUDGETS:
                         ckpts[(r + 1) * ROUND_EPISODES] = prev
             for n, ckpt in ckpts.items():
                 job.rollout(f'n{n}_eval', ckpt, 'left,right', EVAL_N, EVAL_SEED)
                 add_adapt_b(job, f'n{n}', ckpt, s)
             jobs.append(job.write())
-    write_manifest(f"e2_k{base_k}_s{seeds.replace(',', '')}{tag}", jobs)
+    write_manifest(f"{stage}_k{base_k}_s{seeds.replace(',', '')}{tag}", jobs)
 
 
 @cli.command()
@@ -244,6 +274,38 @@ def e2_dev(base_k, seed, configs, episodes):
         job.rollout('eval', f'{job.dir}/ppo/ppo_ep{episodes}.ckpt', 'left,right', EVAL_N, EVAL_SEED)
         jobs.append(job.write())
     write_manifest(f'e2dev_k{base_k}_s{seed}', jobs)
+
+
+# Robustness probes (rollout.py options); positions from the wide range unless the probe changes it
+PROBES = {
+    'push4': '--push_step 50 --push_dist 0.04',
+    'push8': '--push_step 50 --push_dist 0.08',
+    'friction0.1': '--friction_scale 0.1',
+    'far': None,                                   # wider start range, below
+}
+FAR = '[[-0.35,-0.35],[0.15,0.35]]'
+
+
+@cli.command()
+@click.option('--base_k', required=True, type=int)
+@click.option('--seeds', default='0,1,2')
+@click.option('--arms', default='base,e1r/sft/n1000,e1r/filtered_bc/n1000,e1r/awr/n1000')
+def e3(base_k, seeds, arms):
+    """Robustness probes on A and B for finished checkpoints (one job per seed and arm)."""
+    jobs = []
+    for s in map(int, seeds.split(',')):
+        for arm in arms.split(','):
+            ckpt = (f'{RUNS}/e0/base_k{base_k}_s{s}/base/final.ckpt' if arm == 'base' else
+                    f"{RUNS}/{arm.split('/')[0]}/k{base_k}_s{s}/{'/'.join(arm.split('/')[1:])}/final.ckpt")
+            job = Job(f"e3/k{base_k}_s{s}/{arm.replace('/', '_')}")
+            for name, opts in PROBES.items():
+                out = f'{job.dir}/{name}.json'
+                rng = FAR if name == 'far' else WIDE
+                job.lines.append(f"[ -f {out} ] || python -m transfer.rollout --ckpt {ckpt} --pegs left,right --n {EVAL_N} "
+                                 f"--seed_start {EVAL_SEED} --env_meta_from {ENV_META} --out_json {out} "
+                                 f"--nut_range '{rng}'" + (f' {opts}' if opts else ''))
+            jobs.append(job.write())
+    write_manifest(f"e3_k{base_k}_s{seeds.replace(',', '')}", jobs)
 
 
 if __name__ == '__main__':
