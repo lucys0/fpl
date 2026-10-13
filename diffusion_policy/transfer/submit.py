@@ -70,13 +70,14 @@ def snapshot_code():
 @click.option('--cpus', default=None, type=int, help='Override CPUs per job (default 32), e.g. 64 for 60 PPO envs')
 def main(manifest, hi, release_held, after, cpus):
     if release_held:
-        out = subprocess.run(['squeue', '-u', os.environ['USER'], '-h', '-t', 'PD', '-o', '%i|%r|%o'],
+        out = subprocess.run(['squeue', '-u', os.environ['USER'], '-h', '-t', 'PD', '-o', '%i|%r'],
                              capture_output=True, text=True).stdout
         for line in out.splitlines():
-            jobid, reason, cmd = line.split('|', 2)
-            if 'Held' not in reason:
+            jobid, reason = line.split('|', 1)
+            if 'held' not in reason.lower():  # JobHeldUser, or job_requeued_in_held_state after requeuehold
                 continue
-            job_dir = cmd.split()[-1]
+            info = subprocess.run(['scontrol', 'show', 'job', jobid], capture_output=True, text=True).stdout
+            job_dir = os.path.dirname(info.split('StdOut=')[1].split()[0])   # logs go to <job dir>/slurm-%j.out
             bad = sorted(set(open(f'{job_dir}/bad_nodes').read().split())) if os.path.exists(f'{job_dir}/bad_nodes') else []
             subprocess.run(['scontrol', 'update', f'JobId={jobid}', f"ExcNodeList={','.join(EXCLUDE.split(',') + bad)}"], check=True)
             subprocess.run(['scontrol', 'release', jobid], check=True)

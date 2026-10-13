@@ -25,15 +25,19 @@ from transfer.common import (MAX_STEPS, PEGS, env_meta_from, goal_vec, load_chec
                              to_env_action, write_episodes)
 
 PEG_NAMES = {0: 'none', 1: 'left', 2: 'right'}
+LIFT_HEIGHT = 0.05      # m above its start: the nut was grasped and lifted
 
 
 def summarize(episodes):
     n = len(episodes)
     succ = [e for e in episodes if e['success']]
     t1s = [e['first_success_step'] for e in succ]
+    lifted = [e for e in episodes if e['lifted']]
     return {
         'n': n,
         'success': len(succ) / n,
+        'grasp': len(lifted) / n,                                       # nut lifted off the table at some point
+        'place_given_grasp': (sum(e['success'] for e in lifted) / len(lifted)) if lifted else None,
         'wrong_peg': sum(e['final_peg'] not in ('none', e['target_peg']) for e in episodes) / n,
         't1s': float(np.mean(t1s)) if t1s else None,
         'throughput': float(sum(300.0 / t for t in t1s) / n),
@@ -107,8 +111,10 @@ def main(ckpt, pegs, n, seed_start, n_envs, env_meta_path, out_json, record, con
                 first = int(on[0]) if len(on) else -1
                 final_peg = PEG_NAMES[int(pegs_t[first])] if len(on) else 'none'
                 T = first + 1 if len(on) else len(traj['action7'])
+                nut_z = np.asarray(traj['obs'])[:, 2]                    # obs starts with the nut position
                 ep = {'target_peg': peg, 'seed': chunk[i], 'final_peg': final_peg,
-                      'success': final_peg == peg, 'first_success_step': first if final_peg == peg else -1}
+                      'success': final_peg == peg, 'first_success_step': first if final_peg == peg else -1,
+                      'lifted': bool(nut_z.max() > nut_z[0] + LIFT_HEIGHT)}
                 episodes.append(ep)
                 if record:
                     recorded.append({'obs': np.asarray(traj['obs'][:T], dtype=np.float32),

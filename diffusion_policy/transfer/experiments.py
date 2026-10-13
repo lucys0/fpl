@@ -308,5 +308,112 @@ def e3(base_k, seeds, arms):
     write_manifest(f"e3_k{base_k}_s{seeds.replace(',', '')}", jobs)
 
 
+# ======================================================================================
+# Redesign (2026-10-12): mixed-quality data, original nut start range, data-matched A pool
+#
+# Base policies are pretrained (behavior cloning on every episode) on mixed-quality scripted
+# data for both pegs: an imperfect operator that misjudges grasp and placement (gen_mixed.py,
+# quality q in [0.3, 1], about a third succeed). Every offline method post-trains on the SAME
+# pool of mixed-quality task-A episodes (q in [0, 1], about half succeed) and differs only in
+# how it uses the reward. SFT on clean expert A demos is a reference with better data, and PPO
+# is matched by episode count. Measured: task B zero-shot, and how well B is learned from 10
+# clean B demos afterwards (fixed SFT recipe), plus A for context.
+# ======================================================================================
+MIXED_PRETRAIN = [f'{DATA}/pretrain_mixed_left.hdf5', f'{DATA}/pretrain_mixed_right.hdf5']
+A_POOL = f'{DATA}/apool_left.hdf5'
+EXPERT_A = f'{DATA}/sft_left.hdf5'          # clean scripted demos, original range
+CLEAN_B = f'{DATA}/ceil_right.hdf5'
+LEARN_B_K = 10                              # clean B demos for the learnability test
+LEARN_B_STEPS = 2000
+M_METHODS = ('sft_pool', 'filtered_bc', 'awr', 'udrl_scalar', 'udrl_axes', 'sft_expert')
+
+
+def m_base_ckpt(s):
+    return f'{RUNS}/m0/base_s{s}/base/final.ckpt'
+
+
+def add_learn_b(job, tag, ckpt, seed):
+    """How well B is learned from here: SFT on LEARN_B_K clean B demos, then evaluate B."""
+    learned = job.train(f'{tag}_learnB', {'method': 'bc', 'init_ckpt': ckpt, 'seed': seed, 'steps': LEARN_B_STEPS,
+                                          'lr': 1e-4, 'warmup': 100, 'batch_size': 1024,
+                                          'data': [{'path': CLEAN_B, 'first_n': LEARN_B_K}]})
+    job.rollout(f'{tag}_learnB_eval', learned, 'right', EVAL_N, EVAL_SEED, nut_range=None)
+
+
+def m_method_spec(m, n, common):
+    if m == 'sft_pool':
+        return {**common, 'method': 'bc', 'data': [{'path': A_POOL, 'first_n': n}]}
+    if m == 'filtered_bc':
+        return {**common, 'method': 'bc', 'data': [{'path': A_POOL, 'first_n': n, 'success_only': True}]}
+    if m == 'awr':
+        return {**common, 'method': 'awr', 'data': [{'path': A_POOL, 'first_n': n}]}
+    if m.startswith('udrl'):
+        return {**common, 'method': 'udrl', 'udrl_mode': m.split('_')[1], 'data': [{'path': A_POOL, 'first_n': n}]}
+    assert m == 'sft_expert'
+    return {**common, 'method': 'bc', 'data': [{'path': EXPERT_A, 'first_n': n}]}
+
+
+@cli.command()
+@click.option('--seeds', default='0,1,2')
+def m0(seeds):
+    """Base policies: behavior cloning on all mixed-quality pretraining episodes (both pegs)."""
+    jobs = []
+    for s in map(int, seeds.split(',')):
+        job = Job(f'm0/base_s{s}')
+        ckpt = job.train('base', {'method': 'bc', 'seed': s, 'steps': BASE_STEPS, 'lr': 2e-4, 'warmup': 500,
+                                  'batch_size': 1024, 'data': [{'path': p} for p in MIXED_PRETRAIN]})
+        job.rollout('eval', ckpt, 'left,right', EVAL_N, EVAL_SEED, nut_range=None)
+        add_learn_b(job, 'base', ckpt, s)
+        jobs.append(job.write())
+    write_manifest(f"m0_s{seeds.replace(',', '')}", jobs)
+
+
+@cli.command()
+@click.option('--seeds', default='0,1,2')
+@click.option('--methods', default=','.join(M_METHODS))
+@click.option('--replay/--no-replay', default=True, help='Mix the pretraining pool into post-training (50% of steps)')
+def m1(seeds, methods, replay):
+    """Offline post-training on task A from the shared pool; evaluate A, B, and learning B."""
+    stage = 'm1r' if replay else 'm1'
+    jobs = []
+    for s in map(int, seeds.split(',')):
+        replay_data = [{'path': p, 'replay': True} for p in MIXED_PRETRAIN] if replay else []
+        for m in methods.split(','):
+            job = Job(f'{stage}/s{s}/{m}')
+            for n in BUDGETS:
+                common = {'init_ckpt': m_base_ckpt(s), 'seed': s, 'steps': POST_STEPS, 'lr': 1e-4, 'warmup': 200,
+                          'batch_size': 1024, 'replay_frac': 0.5}
+                spec = m_method_spec(m, n, common)
+                spec['data'] = spec['data'] + replay_data
+                ckpt = job.train(f'n{n}', spec)
+                job.rollout(f'n{n}_eval', ckpt, 'left,right', EVAL_N, EVAL_SEED, nut_range=None)
+                if not m.startswith('udrl'):
+                    add_learn_b(job, f'n{n}', ckpt, s)
+            jobs.append(job.write())
+    write_manifest(f"{stage}_s{seeds.replace(',', '')}", jobs)
+
+
+@cli.command()
+@click.option('--seeds', default='0,1,2')
+@click.option('--ppo_spec', default='{}', help='JSON overrides of PPO_SPEC')
+@click.option('--tag', default='')
+def m2(seeds, ppo_spec, tag):
+    """PPO on task A from each base policy, matched by episode count; evaluate A, B, and learning B."""
+    jobs = []
+    for s in map(int, seeds.split(',')):
+        job = Job(f'm2/s{s}/ppo{tag}')
+        spec = {**PPO_SPEC, **json.loads(ppo_spec), 'init_ckpt': m_base_ckpt(s), 'peg': 'left', 'seed': s,
+                'episodes': max(PPO_BUDGETS), 'save_at': list(PPO_BUDGETS), 'env_meta_from': ENV_META,
+                'nut_range': None, 'out_dir': f'{job.dir}/ppo'}
+        json.dump(spec, open(f'{job.dir}/ppo.json', 'w'), indent=1)
+        job.lines.append(f'[ -f {job.dir}/ppo/ppo_ep{max(PPO_BUDGETS)}.ckpt ] || python -m transfer.ppo {job.dir}/ppo.json')
+        for n in PPO_BUDGETS:
+            ckpt = f'{job.dir}/ppo/ppo_ep{n}.ckpt'
+            job.rollout(f'n{n}_eval', ckpt, 'left,right', EVAL_N, EVAL_SEED, nut_range=None)
+            add_learn_b(job, f'n{n}', ckpt, s)
+        jobs.append(job.write())
+    write_manifest(f"m2_s{seeds.replace(',', '')}{tag}", jobs)
+
+
 if __name__ == '__main__':
     cli()
