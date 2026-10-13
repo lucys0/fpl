@@ -34,7 +34,7 @@ from diffusion_policy.gym_util.async_vector_env import AsyncVectorEnv
 from transfer.common import (ACTION_DIM, HORIZON, MAX_STEPS, N_ACTION_STEPS, N_OBS_STEPS, env_meta_from,
                              goal_vec, load_checkpoint, make_env_fn, save_checkpoint, to_env_action)
 
-PEG_ID = {'left': 1, 'right': 2}
+PEG_ID = {'left': 1, 'right': 2, 'round': 2}         # round: the round nut onto the right peg
 A0, A1 = N_OBS_STEPS - 1, N_OBS_STEPS - 1 + N_ACTION_STEPS      # executed slice of the action chunk
 
 
@@ -109,7 +109,8 @@ def main(spec_path):
     opt_critic = torch.optim.Adam(critic.parameters(), lr=spec.get('critic_lr', 1e-3))
 
     n_envs = spec.get('n_envs', 30)
-    env = AsyncVectorEnv([make_env_fn(env_meta_from(spec['env_meta_from']), nut_range=spec.get('nut_range'))] * n_envs)
+    env = AsyncVectorEnv([make_env_fn(env_meta_from(spec['env_meta_from']), nut_range=spec.get('nut_range'),
+                                      nut='round' if peg == 'round' else 'square')] * n_envs)
     gamma, lam, clip = spec.get('gamma', 0.99), spec.get('lam', 0.95), spec.get('clip', 0.1)
     save_at = sorted(spec.get('save_at', [spec['episodes']]))
     episodes_done, it, t0 = 0, 0, time.time()

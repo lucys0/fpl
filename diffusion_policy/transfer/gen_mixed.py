@@ -55,7 +55,8 @@ def perturb(trajectory, d_grasp, d_yaw, d_place):
 @click.option('-o', '--out', required=True)
 @click.option('-n', '--num_episodes', type=int, required=True)
 @click.option('--seed', type=int, required=True)
-@click.option('--target_peg', type=click.Choice(['left', 'right']), required=True)
+@click.option('--target_peg', type=click.Choice(['left', 'right', 'round']), required=True,
+              help='round: the round nut onto the right peg (round_task.py)')
 @click.option('--q_min', type=float, default=0.0)
 @click.option('--q_max', type=float, default=1.0)
 @click.option('--sigma_grasp', type=float, default=0.03, help='m, at q = 1')
@@ -66,14 +67,20 @@ def main(out, num_episodes, seed, target_peg, q_min, q_max, sigma_grasp, sigma_y
     collector = load_collector()
     np.random.seed(seed)
     collector.random.seed(seed)
-    env, env_cfg = collector.create_robomimic_env()
+    if target_peg == 'round':
+        from transfer.round_task import collector_round_classes, create_round_collector_env
+        env, env_cfg = create_round_collector_env(collector)
+        RoundPolicy = collector_round_classes(collector)[1]
+        make_policy = lambda **kw: RoundPolicy(env, target_peg='right', **kw)
+    else:
+        env, env_cfg = collector.create_robomimic_env()
+        make_policy = lambda **kw: collector.create_policy(env, target_peg=target_peg, **kw)
     with h5py.File(out, 'w') as f:
         data = f.create_group('data')
         data.attrs['env_args'] = json.dumps(env_cfg)
         n_succ = 0
         for ep in range(num_episodes):
-            policy = collector.create_policy(env, target_peg=target_peg, noise_level=np.random.uniform(0, 0.12),
-                                             speed_factor=1.0)
+            policy = make_policy(noise_level=np.random.uniform(0, 0.12), speed_factor=1.0)
             policy.speed_factor = np.random.uniform(1.0, 2.0)
             q = np.random.uniform(q_min, q_max)
             d_grasp = np.random.normal(0, q * sigma_grasp, 2)

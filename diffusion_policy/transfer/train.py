@@ -10,7 +10,17 @@ two-peg transfer experiments. One JSON spec per run:
    "replay_frac": 0.5,                       # share of training steps from "replay" data (repeated to reach it)
    "steps": 20000, "lr": 2e-4, "warmup": 500, "batch_size": 1024, "seed": 0,
    "awr": {"gamma": 0.99, "beta": 1.0, "max_weight": 20.0},
+   "kl": {"target": 5.0, "mode": "hinge", "beta": 1e-3, "sub_batch": 128, "ref": init_ckpt,   # optional, below
+          "states": [hdf5, ...]},                # where the KL is measured (default: the training batch)
    "wandb": {"project": ..., "group": ..., "name": ...}}
+
+With "kl", BC is held to a KL budget from the reference policy: KL(ref || policy) is taken through
+PPO's noisy denoising chain (transfer.kl) on observation windows (from "states" files, with each
+episode's goal, else the training batch). Mode "hinge" (default) adds beta * max(0, KL - target), a
+trust-region wall: no force inside the budget, a strong one outside (KL carries a 1/sigma^2 factor, so
+beta 1e-3 already outweighs the BC gradient). Mode "adaptive" adds beta * KL with beta x1.5 per 10
+steps toward the target (PPO's adaptive KL penalty), from "beta0". On its own training states BC moves
+the policy far less than elsewhere, so the budget is only meaningful on the states it is measured on.
 
 Usage: python -m transfer.train spec.json
 """
@@ -31,7 +41,7 @@ from diffusion_policy.common.normalize_util import array_to_stats, get_identity_
 from diffusion_policy.model.common.lr_scheduler import get_scheduler
 from diffusion_policy.model.diffusion.ema_model import EMAModel
 
-from transfer.common import (GOAL_DIM, MAX_STEPS, EpisodeDataset, build_policy, goal_vec,
+from transfer.common import (GOAL_DIM, MAX_STEPS, N_OBS_STEPS, EpisodeDataset, build_policy, goal_vec,
                              load_checkpoint, load_episodes, save_checkpoint, widen_cond)
 
 
@@ -214,23 +224,68 @@ def main(spec_path):
         step, ema.optimization_step = r['step'], r['ema_step']
         log(f"resumed from step {step}")
     save_every = spec.get('save_every')
+    kl_spec = spec.get('kl')
+    if kl_spec:
+        from transfer.kl import chain_kl, cond_of, ref_chain
+        _, ref, _ = load_checkpoint(kl_spec.get('ref', spec['init_ckpt']), device)
+        ref.eval()
+        ref.requires_grad_(False)
+        kl_target, kl_mode = kl_spec['target'], kl_spec.get('mode', 'hinge')
+        beta = kl_spec.get('beta', 1e-3) if kl_mode == 'hinge' else kl_spec.get('beta0', 1e-6)
+        kl_ema, kls = None, []
+        kl_obs = None
+        if kl_spec.get('states'):
+            kl_rng, wins = np.random.default_rng(seed), []
+            for path in kl_spec['states']:
+                for ep in load_episodes(path):
+                    g = goal_vec(ep['attrs']['target_peg'])
+                    for t in kl_rng.integers(N_OBS_STEPS - 1, len(ep['obs']), size=50):
+                        wins.append(np.concatenate([ep['obs'][t - N_OBS_STEPS + 1:t + 1],
+                                                    np.broadcast_to(g, (N_OBS_STEPS, len(g)))], axis=-1))
+            kl_obs = torch.from_numpy(np.stack(wins).astype(np.float32)).to(device)
+            log(f"KL measured on {len(kl_obs)} windows from {kl_spec['states']}")
+        if os.path.exists(resume_path):
+            beta, kl_ema = r.get('kl_beta', beta), r.get('kl_ema')
     policy.train()
     while step < steps:
         for batch in loader:
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
             loss = policy.compute_loss(batch)
+            if kl_spec:
+                sub = kl_spec.get('sub_batch', 128)
+                cond = cond_of(ref, batch['obs'][:sub] if kl_obs is None else
+                               kl_obs[torch.randint(len(kl_obs), (sub,), device=device)])
+                chain = ref_chain(ref, cond)
+                policy.model.eval()                  # dropout off, as in PPO
+                kl = chain_kl(policy, cond, chain).mean()
+                policy.model.train()
+                kl_ema = kl.item() if kl_ema is None else 0.9 * kl_ema + 0.1 * kl.item()
+                kls.append(kl.item())
+                if kl_mode == 'hinge':
+                    loss = loss + beta * torch.relu(kl - kl_target)
+                else:
+                    loss = loss + beta * kl
+                    if step % 10 == 0:
+                        if kl_ema > 1.5 * kl_target:
+                            beta *= 1.5
+                        elif kl_ema < kl_target / 1.5:
+                            beta = max(beta / 1.5, 1e-9)
             optimizer.zero_grad(); loss.backward(); optimizer.step(); scheduler.step()
             ema.step(policy)
             losses.append(loss.item()); step += 1
             if step % 500 == 0 or step == steps:
                 log(f"step {step}/{steps} loss {np.mean(losses):.4f} lr {scheduler.get_last_lr()[0]:.2e} "
-                    f"({step / (time.time() - t0):.1f} it/s)")
+                    + (f"KL {np.mean(kls):.2f} (target {kl_target}, above it {np.mean(np.array(kls) > kl_target):.0%}) "
+                       f"beta {beta:.2e} " if kl_spec else '')
+                    + f"({step / (time.time() - t0):.1f} it/s)")
+                kls = [] if kl_spec else None
                 if wb: wb.log({'train_loss': np.mean(losses), 'lr': scheduler.get_last_lr()[0]}, step=step)
                 losses = []
             if step % resume_every == 0 and step < steps:
                 torch.save({'policy': policy.state_dict(), 'ema': ema_policy.state_dict(),
                             'optimizer': optimizer.state_dict(), 'scheduler': scheduler.state_dict(),
-                            'step': step, 'ema_step': ema.optimization_step}, resume_path + '.tmp')
+                            'step': step, 'ema_step': ema.optimization_step,
+                            **({'kl_beta': beta, 'kl_ema': kl_ema} if kl_spec else {})}, resume_path + '.tmp')
                 os.replace(resume_path + '.tmp', resume_path)
             if save_every and step % save_every == 0 and step < steps:
                 save_checkpoint(os.path.join(out_dir, f'step{step}.ckpt'), policy, ema_policy, extra_dim, info)

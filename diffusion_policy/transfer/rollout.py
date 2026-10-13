@@ -21,7 +21,7 @@ import torch
 
 from diffusion_policy.gym_util.async_vector_env import AsyncVectorEnv
 
-from transfer.common import (MAX_STEPS, PEGS, env_meta_from, goal_vec, load_checkpoint, make_env_fn,
+from transfer.common import (MAX_STEPS, TASK_PEG, TASKS, env_meta_from, goal_vec, load_checkpoint, make_env_fn,
                              to_env_action, write_episodes)
 
 PEG_NAMES = {0: 'none', 1: 'left', 2: 'right'}
@@ -38,7 +38,7 @@ def summarize(episodes):
         'success': len(succ) / n,
         'grasp': len(lifted) / n,                                       # nut lifted off the table at some point
         'place_given_grasp': (sum(e['success'] for e in lifted) / len(lifted)) if lifted else None,
-        'wrong_peg': sum(e['final_peg'] not in ('none', e['target_peg']) for e in episodes) / n,
+        'wrong_peg': sum(e['final_peg'] not in ('none', TASK_PEG[e['target_peg']]) for e in episodes) / n,
         't1s': float(np.mean(t1s)) if t1s else None,
         'throughput': float(sum(300.0 / t for t in t1s) / n),
     }
@@ -80,12 +80,19 @@ def main(ckpt, pegs, n, seed_start, n_envs, env_meta_path, out_json, record, con
         n_envs = max(1, len(os.sched_getaffinity(0)) - 2)
     n_envs = min(n_envs, n)
     env_meta = env_meta_from(env_meta_path)
-    env = AsyncVectorEnv([make_env_fn(env_meta, nut_range=nut_range, push_step=push_step, push_dist=push_dist,
-                                      friction_scale=friction_scale)] * n_envs)
+    envs = {}
+
+    def env_for(peg):
+        nut = 'round' if peg == 'round' else 'square'
+        if nut not in envs:
+            envs[nut] = AsyncVectorEnv([make_env_fn(env_meta, nut_range=nut_range, push_step=push_step, push_dist=push_dist,
+                                                    friction_scale=friction_scale, nut=nut)] * n_envs)
+        return envs[nut]
 
     results, recorded = {}, []
     for peg in pegs.split(','):
-        assert peg in PEGS
+        assert peg in TASKS
+        env = env_for(peg)
         cond_vec = np.concatenate([goal_vec(peg), np.asarray(extra, dtype=np.float32)]).astype(np.float32)
         episodes = []
         seeds = list(range(seed_start, seed_start + n))
@@ -113,7 +120,7 @@ def main(ckpt, pegs, n, seed_start, n_envs, env_meta_path, out_json, record, con
                 T = first + 1 if len(on) else len(traj['action7'])
                 nut_z = np.asarray(traj['obs'])[:, 2]                    # obs starts with the nut position
                 ep = {'target_peg': peg, 'seed': chunk[i], 'final_peg': final_peg,
-                      'success': final_peg == peg, 'first_success_step': first if final_peg == peg else -1,
+                      'success': final_peg == TASK_PEG[peg], 'first_success_step': first if final_peg == TASK_PEG[peg] else -1,
                       'lifted': bool(nut_z.max() > nut_z[0] + LIFT_HEIGHT)}
                 episodes.append(ep)
                 if record:
@@ -124,7 +131,8 @@ def main(ckpt, pegs, n, seed_start, n_envs, env_meta_path, out_json, record, con
                   f"{np.mean([e['success'] for e in episodes]):.2f}", flush=True)
         results[peg] = {**summarize(episodes), 'episodes': episodes}
         print(f"{peg}: {json.dumps({k: v for k, v in results[peg].items() if k != 'episodes'})}", flush=True)
-    env.close()
+    for e in envs.values():
+        e.close()
 
     os.makedirs(os.path.dirname(os.path.abspath(out_json)), exist_ok=True)
     with open(out_json, 'w') as f:

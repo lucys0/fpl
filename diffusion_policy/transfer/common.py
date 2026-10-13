@@ -37,11 +37,14 @@ ACTION_DIM = 10                      # pos (3) + rotation_6d (6) + gripper (1)
 HORIZON, N_OBS_STEPS, N_ACTION_STEPS = 16, 2, 8
 MAX_STEPS = 500
 PEGS = ('left', 'right')
+TASKS = ('left', 'right', 'round')           # round: the round nut onto the right (round) peg, see round_task.py
+TASK_PEG = {'left': 'left', 'right': 'right', 'round': 'right'}       # the peg each task's nut must land on
 
 _ROT = RotationTransformer(from_rep='axis_angle', to_rep='rotation_6d')
 
 
 def goal_vec(peg):
+    """Goal input; 'right' and 'round' (the B task of each task pair) share B's slot."""
     return np.array([1.0, 0.0] if peg == 'left' else [0.0, 1.0], dtype=np.float32)
 
 
@@ -223,7 +226,7 @@ class RecordingWrapper(gym.Wrapper):
     def step(self, action):
         obs, reward, done, info = self.env.step(action)
         rs = self.unwrapped.env.env                # TwoPeg wrapper -> robomimic env -> robosuite env
-        nut = rs.sim.data.body_xpos[rs.obj_body_id['SquareNut']]
+        nut = rs.sim.data.body_xpos[rs.obj_body_id[getattr(self.unwrapped, 'nut_name', 'SquareNut')]]
         peg = 1 if rs.on_peg(nut, 0) else (2 if rs.on_peg(nut, 1) else 0)   # 1 = left, 2 = right
         self.traj['action7'].append(np.asarray(action, dtype=np.float32))
         self.traj['obs'].append(obs)
@@ -278,14 +281,21 @@ class ProbeWrapper(gym.Wrapper):
         return obs, reward, done, info
 
 
-def make_env_fn(env_meta, max_steps=MAX_STEPS, nut_range=None, push_step=None, push_dist=0.0, friction_scale=1.0):
-    """Two-peg env, recorded, with diffusion policy's multi-step execution."""
+def make_env_fn(env_meta, max_steps=MAX_STEPS, nut_range=None, push_step=None, push_dist=0.0, friction_scale=1.0,
+                nut='square'):
+    """Two-peg env, recorded, with diffusion policy's multi-step execution; nut 'round' for the round-nut task."""
     def env_fn():
         from diffusion_policy.env.robomimic.robomimic_twopeg_lowdim_wrapper import RobomimicTwoPegLowdimWrapper
         from diffusion_policy.env_runner.robomimic_lowdim_runner import create_env
         from diffusion_policy.gym_util.multistep_wrapper import MultiStepWrapper
-        twopeg = RobomimicTwoPegLowdimWrapper(env=create_env(env_meta=env_meta, obs_keys=OBS_KEYS),
-                                              obs_keys=OBS_KEYS, init_state=None)
+        if nut == 'round':
+            from transfer.round_task import RoundNutTwoPegWrapper, round_env_meta
+            assert nut_range is None and push_step is None and friction_scale == 1.0, 'probes are square-nut only'
+            twopeg = RoundNutTwoPegWrapper(env=create_env(env_meta=round_env_meta(env_meta), obs_keys=OBS_KEYS),
+                                           obs_keys=OBS_KEYS, init_state=None)
+        else:
+            twopeg = RobomimicTwoPegLowdimWrapper(env=create_env(env_meta=env_meta, obs_keys=OBS_KEYS),
+                                                  obs_keys=OBS_KEYS, init_state=None)
         if nut_range is not None:
             lo, hi = np.asarray(nut_range[0]), np.asarray(nut_range[1])
             base_make = twopeg._make_init_state

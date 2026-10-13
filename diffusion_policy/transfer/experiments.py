@@ -525,5 +525,156 @@ def m5(seeds, methods, lrs):
     write_manifest(f"m5_s{seeds.replace(',', '')}" + ('' if lrs == default else '_' + lrs.replace(',', '_')), jobs)
 
 
+B_PPO_BUDGETS = (200, 1000, 3000)
+
+
+def m6_starts(s):
+    """Checkpoints PPO on B starts from. Arms whose B success is 0 (supervised without replay) are left out:
+    with a sparse reward, PPO has nothing to learn from."""
+    return {'base': m_base_ckpt(s),
+            'ppoA6000': f'{RUNS}/m2/s{s}/ppo/ppo/ppo_ep6000.ckpt',
+            'filtered_bc_r1000': f'{RUNS}/m1r/s{s}/filtered_bc/n1000/final.ckpt',
+            'sft_expert_r1000': f'{RUNS}/m1r/s{s}/sft_expert/n1000/final.ckpt',
+            'awr_r1000': f'{RUNS}/m1r/s{s}/awr/n1000/final.ckpt'}
+
+
+@cli.command()
+@click.option('--seeds', default='0,1,2')
+@click.option('--starts', default='base,ppoA6000,filtered_bc_r1000,sft_expert_r1000,awr_r1000')
+@click.option('--extra_start', multiple=True, help='name=checkpoint path with {s} for the seed, e.g. a KL-BC run')
+def m6(seeds, starts, extra_start):
+    """PPO on B (right peg) from checkpoints post-trained on A: does RL on A speed up RL on B?"""
+    jobs = []
+    for s in map(int, seeds.split(',')):
+        pool = m6_starts(s)
+        pool.update({kv.split('=', 1)[0]: kv.split('=', 1)[1].format(s=s) for kv in extra_start})
+        names = starts.split(',') + [kv.split('=', 1)[0] for kv in extra_start]
+        for name in names:
+            job = Job(f'm6/s{s}/{name}')
+            spec = {**PPO_SPEC, 'init_ckpt': pool[name], 'peg': 'right', 'seed': s, 'episodes': max(B_PPO_BUDGETS),
+                    'save_at': list(B_PPO_BUDGETS), 'env_meta_from': ENV_META, 'nut_range': None, 'out_dir': f'{job.dir}/ppo'}
+            json.dump(spec, open(f'{job.dir}/ppo.json', 'w'), indent=1)
+            job.lines.append(f'[ -f {job.dir}/ppo/ppo_ep{max(B_PPO_BUDGETS)}.ckpt ] || python -m transfer.ppo {job.dir}/ppo.json')
+            for n in B_PPO_BUDGETS:
+                job.rollout(f'n{n}_eval', f'{job.dir}/ppo/ppo_ep{n}.ckpt', 'left,right', EVAL_N, EVAL_SEED, nut_range=None)
+            jobs.append(job.write())
+    write_manifest(f"m6_s{seeds.replace(',', '')}" + (f"_{'_'.join(kv.split('=')[0] for kv in extra_start)}"
+                                                       if extra_start else ''), jobs)
+
+
+@cli.command()
+@click.option('--seeds', default='0,1,2')
+@click.option('--methods', default='filtered_bc,sft_expert')
+@click.option('--budgets', default='3000,6000', help="PPO episode counts whose KL from the base is the target")
+@click.option('--kl_json', default=f'{ROOT}/results/m_kl.json', help='transfer.m_kl output with the PPO rows')
+@click.option('--lr', default=1e-5)
+@click.option('--steps', default=5000)
+def m7(seeds, methods, budgets, kl_json, lr, steps):
+    """BC on A without replay, held to PPO's KL from the base (KL through PPO's denoising chain, on A
+    states, with an adaptive penalty): does staying as close to the base as PPO explain PPO's transfer?"""
+    kl = json.load(open(kl_json))
+    jobs = []
+    for s in map(int, seeds.split(',')):
+        for n in map(int, budgets.split(',')):
+            target = next(r['kl_A'] for r in kl[f'PPO | {n} ep.'] if r['seed'] == s)
+            for m in methods.split(','):
+                job = Job(f'm7/s{s}/{m}_klppo{n}')
+                common = {'init_ckpt': m_base_ckpt(s), 'seed': s, 'steps': steps, 'lr': lr, 'warmup': 200,
+                          'batch_size': 1024, 'save_every': 500,
+                          'kl': {'target': round(target, 4), 'sub_batch': 128, 'states': [MIXED_PRETRAIN[0]]}}
+                final = job.train('train', m_method_spec(m, 1000, common))
+                for st in (500, 1000, 2500, steps):
+                    ckpt = final if st == steps else final.replace('final.ckpt', f'step{st}.ckpt')
+                    job.rollout(f'step{st}_eval', ckpt, 'left,right', EVAL_N, EVAL_SEED, nut_range=None)
+                jobs.append(job.write())
+    write_manifest(f"m7_s{seeds.replace(',', '')}", jobs)
+
+
+# ======================================================================================
+# Second task pair (2026-10-13): A = the square nut onto the left peg, as before; B = the ROUND nut,
+# grasped by the far side of its ring, onto the round (right) peg (round_task.py) - a different object,
+# grasp point, wrist angle and peg. Same recipe: the base imitates both tasks' mixed-quality demos; the
+# A data and arms are the first pair's. Evaluated on 'left' (A) and 'round' (B).
+# ======================================================================================
+X_PRETRAIN = [f'{DATA}/pretrain_mixed_left.hdf5', f'{DATA}/pretrain_mixed_round.hdf5']
+X_PEGS = 'left,round'
+
+
+def x_base_ckpt(s):
+    return f'{RUNS}/x0/base_s{s}/base/final.ckpt'
+
+
+@cli.command()
+@click.option('--seeds', default='0,1,2')
+def x0(seeds):
+    """Base policies for the second pair: behavior cloning on both tasks' mixed-quality episodes."""
+    jobs = []
+    for s in map(int, seeds.split(',')):
+        job = Job(f'x0/base_s{s}')
+        ckpt = job.train('base', {'method': 'bc', 'seed': s, 'steps': BASE_STEPS, 'lr': 2e-4, 'warmup': 500,
+                                  'batch_size': 1024, 'data': [{'path': p} for p in X_PRETRAIN]})
+        job.rollout('eval', ckpt, X_PEGS, EVAL_N, EVAL_SEED, nut_range=None)
+        jobs.append(job.write())
+    write_manifest(f"x0_s{seeds.replace(',', '')}", jobs)
+
+
+@cli.command()
+@click.option('--seeds', default='0,1,2')
+@click.option('--methods', default='filtered_bc,sft_expert')
+def x1(seeds, methods):
+    """Offline post-training on A (N=1000, 50% replay of both tasks' pretraining data), second pair."""
+    jobs = []
+    for s in map(int, seeds.split(',')):
+        for m in methods.split(','):
+            job = Job(f'x1r/s{s}/{m}')
+            common = {'init_ckpt': x_base_ckpt(s), 'seed': s, 'steps': POST_STEPS, 'lr': 1e-4, 'warmup': 200,
+                      'batch_size': 1024, 'replay_frac': 0.5}
+            spec = m_method_spec(m, 1000, common)
+            spec['data'] = spec['data'] + [{'path': p, 'replay': True} for p in X_PRETRAIN]
+            ckpt = job.train('n1000', spec)
+            job.rollout('n1000_eval', ckpt, X_PEGS, EVAL_N, EVAL_SEED, nut_range=None)
+            jobs.append(job.write())
+    write_manifest(f"x1r_s{seeds.replace(',', '')}", jobs)
+
+
+@cli.command()
+@click.option('--seeds', default='0,1,2')
+def x2(seeds):
+    """PPO on A from the second pair's bases; evaluated on A and on the round-nut task."""
+    jobs = []
+    budgets = (1000, 3000, 6000)
+    for s in map(int, seeds.split(',')):
+        job = Job(f'x2/s{s}/ppo')
+        spec = {**PPO_SPEC, 'init_ckpt': x_base_ckpt(s), 'peg': 'left', 'seed': s, 'episodes': max(budgets),
+                'save_at': list(budgets), 'env_meta_from': ENV_META, 'nut_range': None, 'out_dir': f'{job.dir}/ppo'}
+        json.dump(spec, open(f'{job.dir}/ppo.json', 'w'), indent=1)
+        job.lines.append(f'[ -f {job.dir}/ppo/ppo_ep{max(budgets)}.ckpt ] || python -m transfer.ppo {job.dir}/ppo.json')
+        for n in budgets:
+            job.rollout(f'n{n}_eval', f'{job.dir}/ppo/ppo_ep{n}.ckpt', X_PEGS, EVAL_N, EVAL_SEED, nut_range=None)
+        jobs.append(job.write())
+    write_manifest(f"x2_s{seeds.replace(',', '')}", jobs)
+
+
+@cli.command()
+@click.option('--seeds', default='0,1,2')
+@click.option('--methods', default='sft_expert,filtered_bc')
+def x5(seeds, methods):
+    """Supervised post-training on A without replay at PPO's learning rate (1e-6), evaluated along
+    the way, second pair."""
+    jobs = []
+    lr, steps, every, evals = M5_SCHEDULES['1e-06early']
+    for s in map(int, seeds.split(',')):
+        for m in methods.split(','):
+            job = Job(f'x5/s{s}/{m}_lr1e-06early')
+            common = {'init_ckpt': x_base_ckpt(s), 'seed': s, 'steps': steps, 'lr': lr, 'warmup': min(200, steps // 10),
+                      'batch_size': 1024, 'save_every': every}
+            final = job.train('train', m_method_spec(m, 1000, common))
+            for st in evals:
+                ckpt = final if st == steps else final.replace('final.ckpt', f'step{st}.ckpt')
+                job.rollout(f'step{st}_eval', ckpt, X_PEGS, EVAL_N, EVAL_SEED, nut_range=None)
+            jobs.append(job.write())
+    write_manifest(f"x5_s{seeds.replace(',', '')}", jobs)
+
+
 if __name__ == '__main__':
     cli()
