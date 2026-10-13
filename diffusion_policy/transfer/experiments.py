@@ -456,5 +456,36 @@ def m2(seeds, ppo_spec, tag):
     write_manifest(f"m2_s{seeds.replace(',', '')}{tag}", jobs)
 
 
+@cli.command()
+@click.option('--seeds', default='0,1,2')
+@click.option('--methods', default='filtered_bc,awr')
+@click.option('--learn_ks', default='10,3,5')
+def m4(seeds, methods, learn_ks):
+    """Online iterated filtered BC / AWR on task A, no replay: PPO's data source and episode budgets.
+
+    Each round collects ROUND_EPISODES with the current policy and fine-tunes it on everything
+    collected so far (successes only for filtered BC); checkpoints at ONLINE_BUDGETS episodes are
+    evaluated like the other arms."""
+    jobs = []
+    for s in map(int, seeds.split(',')):
+        for m in methods.split(','):
+            job = Job(f'm4/s{s}/{m}')
+            method = 'bc' if m == 'filtered_bc' else 'awr'
+            prev, data = m_base_ckpt(s), []
+            for r in range(max(ONLINE_BUDGETS) // ROUND_EPISODES):
+                rec = job.rollout(f'r{r}_rollouts', prev, 'left', ROUND_EPISODES,
+                                  3_000_000 + 100_000 * s + ROUND_EPISODES * r, record=True, nut_range=None)
+                data.append({'path': rec, 'success_only': method == 'bc'})
+                prev = job.train(f'r{r}', {'method': method, 'init_ckpt': prev, 'seed': s, 'steps': ROUND_STEPS,
+                                           'lr': 1e-4, 'warmup': 100, 'batch_size': 1024, 'data': list(data)})
+                n = (r + 1) * ROUND_EPISODES
+                if n in ONLINE_BUDGETS:
+                    job.rollout(f'n{n}_eval', prev, 'left,right', EVAL_N, EVAL_SEED, nut_range=None)
+                    for k in map(int, learn_ks.split(',')):
+                        add_learn_b(job, f'n{n}', prev, s, k)
+            jobs.append(job.write())
+    write_manifest(f"m4_s{seeds.replace(',', '')}", jobs)
+
+
 if __name__ == '__main__':
     cli()

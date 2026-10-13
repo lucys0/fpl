@@ -84,8 +84,15 @@ def main(seeds, ks):
         if any(ev.values()):
             lr = {k: {s: learn(f'{R}/m2/s{s}/ppo', f'{R}/m3/m2/s{s}/ppo', f'n{n}', k) for s in seeds} for k in ks}
             ppo.append(row(f'ppo, {n} episodes', ev, lr))
+    for m in ('filtered_bc', 'awr'):
+        for n in (200, 1000, 3000):
+            ev = {s: res(f'{R}/m4/s{s}/{m}/n{n}_eval.json') for s in seeds}
+            if any(ev.values()):
+                lr = {k: {s: learn(f'{R}/m4/s{s}/{m}', f'{R}/m3/m4/s{s}/{m}', f'n{n}', k) for s in seeds} for k in ks}
+                ppo.append(row(f'iterated {m}, {n} episodes', ev, lr))
     if ppo:
-        text += '\n\n**PPO on A (online, no replay)**\n\n' + head + '\n' + '\n'.join(ppo)
+        text += ('\n\n**Online on A, no replay (PPO, and filtered BC / AWR iterated on their own rollouts)**\n\n'
+                 + head + '\n' + '\n'.join(ppo))
     print(text)
 
 

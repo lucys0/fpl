@@ -23,9 +23,10 @@ REPO = '/iris/u/lucyshi/fpl/diffusion_policy'
 I = '/iris/u/lucyshi'
 # iris4: small GPUs; iris8: GPU driver hung on 2026-10-12 (CUDA init blocks in the NVIDIA driver);
 # iris-hgx-*: H100/H200 (sm_90), which the pinned torch 1.12 + CUDA 11.6 has no kernels for;
-# iris1: failed the GPU check on every job of 2026-10-12. The rest are sc-freegpu nodes that don't
-# mount /iris (orion-dgx) or weren't checked; macondo[1-2] and deep[17-25] were.
-EXCLUDE = ('iris1,iris4,iris8,iris-hgx-1,iris-hgx-2,'
+# iris1, iris9, iris10: one GPU each fails the GPU check (2026-10-12); being the free one, it got every
+# new job. The rest are sc-freegpu nodes that don't mount /iris (orion-dgx) or weren't checked;
+# macondo[1-2] and deep[17-25] were.
+EXCLUDE = ('iris1,iris4,iris8,iris9,iris10,iris-hgx-1,iris-hgx-2,'
            'orion-dgx,dawn[1-8],dawn[10-18],britten[1-2],charlotte,macondo-dgx1,visionlab-dgx1')
 
 WRAPPER = f'''#!/bin/bash
