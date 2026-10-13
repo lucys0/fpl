@@ -1,8 +1,12 @@
 """
-Figures for the redesigned transfer experiment (mean +/- SE over seeds).
+Figures for the redesigned transfer experiment (mean +/- SE over seeds; changes are
+against each seed's base policy on the same start states).
 
-  left:  change on task B against change on task A, per arm (post-training on A only)
-  right: task B success after fine-tuning on K clean B demos, against K
+  (a) no replay: change on task B against change on task A along training - PPO vs
+      supervised post-training (offline at three learning rates, and iterated on the
+      policy's own rollouts)
+  (b) with replay of the pretraining pool: offline arms at N = 200 / 1000
+  (c) task B success after fine-tuning on K clean B demos, against K
 
   python -m transfer.m_plot [--seeds 0,1,2] [--out results/m_transfer.png]
 """
@@ -24,6 +28,9 @@ COLORS = {'sft_pool': 'tab:blue', 'filtered_bc': 'tab:orange', 'awr': 'tab:green
           'udrl_axes': 'tab:pink', 'sft_expert': 'tab:gray', 'ppo': 'tab:red'}
 LABELS = {'sft_pool': 'SFT (pool)', 'filtered_bc': 'filtered BC', 'awr': 'AWR', 'udrl_scalar': 'UDRL (scalar)',
           'udrl_axes': 'UDRL (axes)', 'sft_expert': 'SFT (expert demos)', 'ppo': 'PPO'}
+LR_STYLE = {'1e-04': ':', '1e-05': '-.', '1e-06early': '--', '1e-06': '--'}
+M5 = {'1e-04': (100, 200, 500, 1000), '1e-05': (500, 1000, 2500, 5000),
+      '1e-06early': (100, 200, 400, 700, 1000), '1e-06': (1000, 3000, 6000, 10000)}
 
 
 def res(p):
@@ -46,102 +53,106 @@ def learn(job_dir, m3_dir, tag, k):
     return res(f'{job_dir}/{name}') or res(f'{m3_dir}/{name}')
 
 
-def arms(seeds):
-    """(name, method, stage, budget, {seed: eval}, {seed: job dir}, {seed: m3 dir}, tag)"""
-    out = []
-    for stage in ('m1r', 'm1'):
-        for m in COLORS:
-            if m == 'ppo':
-                continue
-            for n in (200, 1000):
-                out.append((f'{stage}/{m}/n{n}', m, stage, n,
-                            {s: res(f'{R}/{stage}/s{s}/{m}/n{n}_eval.json') for s in seeds},
-                            {s: f'{R}/{stage}/s{s}/{m}' for s in seeds},
-                            {s: f'{R}/m3/{stage}/s{s}/{m}' for s in seeds}, f'n{n}'))
-    for n in (200, 1000, 3000, 6000):
-        out.append((f'm2/ppo/n{n}', 'ppo', 'm2', n, {s: res(f'{R}/m2/s{s}/ppo/n{n}_eval.json') for s in seeds},
-                    {s: f'{R}/m2/s{s}/ppo' for s in seeds}, {s: f'{R}/m3/m2/s{s}/ppo' for s in seeds}, f'n{n}'))
-    for m in ('filtered_bc', 'awr'):
-        for n in (200, 1000, 3000):
-            out.append((f'm4/{m}/n{n}', m, 'm4', n, {s: res(f'{R}/m4/s{s}/{m}/n{n}_eval.json') for s in seeds},
-                        {s: f'{R}/m4/s{s}/{m}' for s in seeds}, {s: f'{R}/m3/m4/s{s}/{m}' for s in seeds}, f'n{n}'))
-    return out
-
-
 @click.command()
 @click.option('--seeds', default='0,1,2')
 @click.option('--out', default='/iris/u/lucyshi/fpl_transfer/results/m_transfer.png')
-def main(seeds, out):
+@click.option('--min_seeds', default=2, help='Plot a point only when this many seeds have it')
+def main(seeds, out, min_seeds):
     seeds = [int(s) for s in seeds.split(',')]
     base = {s: res(f'{R}/m0/base_s{s}/eval.json') for s in seeds}
-    base_learn = {k: {s: learn(f'{R}/m0/base_s{s}', f'{R}/m3/m0/s{s}/base', 'base', k) for s in seeds} for k in KS}
-    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 5.5))
 
-    # ---- B change vs A change
-    ppo_pts, online = [], {}
-    for name, m, stage, n, ev, _, _, _ in arms(seeds):
-        dA = mean_se([succ(ev[s], 'left') - succ(base[s], 'left') for s in seeds if ev[s] and base[s]])
-        dB = mean_se([succ(ev[s], 'right') - succ(base[s], 'right') for s in seeds if ev[s] and base[s]])
-        if dA[0] is None:
-            continue
+    def delta(path_fn):
+        """mean/SE over seeds of (dA, dB) for an eval path function of the seed."""
+        ev = {s: res(path_fn(s)) for s in seeds}
+        ok = [s for s in seeds if ev[s] and base[s]]
+        if len(ok) < min_seeds:
+            return None
+        return (mean_se([succ(ev[s], 'left') - succ(base[s], 'left') for s in ok]),
+                mean_se([succ(ev[s], 'right') - succ(base[s], 'right') for s in ok]))
+
+    def path(ax, pts, color, ls, marker, label, mfc=None, annotate=None):
+        pts = [p for p in pts if p[1] is not None]
+        if not pts:
+            return
+        xs = [0] + [p[1][0][0] for p in pts]
+        ys = [0] + [p[1][1][0] for p in pts]
+        ax.plot(xs, ys, ls, color=color, alpha=0.6, lw=1.5)
+        for i, (n, (dA, dB)) in enumerate(pts):
+            ax.errorbar(dA[0], dB[0], xerr=dA[1], yerr=dB[1], fmt=marker, ms=6, color=color,
+                        mfc=mfc or color, capsize=2, label=label if i == len(pts) - 1 else None)
+            if annotate:
+                ax.annotate(annotate(n), (dA[0], dB[0]), textcoords='offset points', xytext=(4, 3), fontsize=7,
+                            color=color)
+
+    def diagonal(ax):
+        ax.axhline(0, color='k', lw=0.6); ax.axvline(0, color='k', lw=0.6)
+        (x0, x1), (y0, y1) = ax.get_xlim(), ax.get_ylim()
+        lo, hi = min(x0, y0), max(x1, y1)
+        ax.plot([lo, hi], [lo, hi], color='k', lw=0.6, alpha=0.4)
+        ax.set_xlim(x0, x1); ax.set_ylim(y0, y1)
+        ax.set_xlabel('Δ success on A (post-trained task)'); ax.set_ylabel('Δ success on B (zero-shot)')
+
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(20, 6.2))
+
+    # ---- (a) no replay: paths along training
+    ppo = [(n, delta(lambda s, n=n: f'{R}/m2/s{s}/ppo/n{n}_eval.json')) for n in (200, 1000, 3000, 6000)]
+    path(ax1, ppo, COLORS['ppo'], '-', '^', 'PPO (lr 1e-6), episodes', annotate=str)
+    for m in ('filtered_bc', 'sft_expert'):
+        for lr in ('1e-04', '1e-05', '1e-06early'):
+            pts = [(st, delta(lambda s, st=st: f'{R}/m5/s{s}/{m}_lr{lr}/step{st}_eval.json')) for st in M5[lr]]
+            if lr == '1e-06early':     # continue the early-steps run's path with the longer run at the same lr
+                pts += [(st, delta(lambda s, st=st: f'{R}/m5/s{s}/{m}_lr1e-06/step{st}_eval.json'))
+                        for st in M5['1e-06'][1:]]
+            path(ax1, pts, COLORS[m], LR_STYLE[lr], 'o', f"{LABELS[m]}, offline, lr {lr.replace('early', '')}",
+                 mfc='white')
+    for m, tag, ns, ls in (('filtered_bc', '', (200, 1000, 3000), ':'),
+                           ('filtered_bc', '_lr1e-06', (200, 400, 600, 800, 1000), '--'),
+                           ('awr', '', (200, 1000, 3000), ':')):
+        pts = [(n, delta(lambda s, n=n: f'{R}/m4/s{s}/{m}{tag}/n{n}_eval.json')) for n in ns]
+        lr = '1e-6' if tag else '1e-4'
+        path(ax1, pts, COLORS[m], ls, 'D', f'{LABELS[m]}, iterated on own rollouts, lr {lr}', annotate=str)
+    diagonal(ax1)
+    ax1.set_title('(a) No replay: B vs A along training\n(grey line: ΔB = ΔA; labels: episodes)')
+    ax1.legend(fontsize=7, loc='lower left')
+
+    # ---- (b) with replay: offline arms
+    for m in COLORS:
         if m == 'ppo':
-            ppo_pts.append((n, dA, dB))
             continue
-        if stage == 'm4':
-            online.setdefault(m, []).append((n, dA, dB))
-            continue
-        filled = stage == 'm1r'
-        ax1.errorbar(dA[0], dB[0], xerr=dA[1], yerr=dB[1], fmt='o' if n == 1000 else 's', ms=8 if n == 1000 else 6,
-                     color=COLORS[m], mfc=COLORS[m] if filled else 'white', capsize=2, alpha=0.9)
-    if ppo_pts:
-        ppo_pts.sort()
-        ax1.plot([0] + [p[1][0] for p in ppo_pts], [0] + [p[2][0] for p in ppo_pts], '-', color=COLORS['ppo'], alpha=0.5)
-        for n, dA, dB in ppo_pts:
-            ax1.errorbar(dA[0], dB[0], xerr=dA[1], yerr=dB[1], fmt='^', ms=8, color=COLORS['ppo'], capsize=2)
-            ax1.annotate(str(n), (dA[0], dB[0]), textcoords='offset points', xytext=(5, 4), fontsize=8,
-                         color=COLORS['ppo'])
-    for m, pts in online.items():
-        pts.sort()
-        ax1.plot([0] + [p[1][0] for p in pts], [0] + [p[2][0] for p in pts], '--', color=COLORS[m], alpha=0.5)
-        for n, dA, dB in pts:
-            ax1.errorbar(dA[0], dB[0], xerr=dA[1], yerr=dB[1], fmt='D', ms=7, color=COLORS[m], mfc='white', capsize=2)
-            ax1.annotate(str(n), (dA[0], dB[0]), textcoords='offset points', xytext=(5, -10), fontsize=8, color=COLORS[m])
-    (x0, x1), (y0, y1) = ax1.get_xlim(), ax1.get_ylim()
-    lo, hi = min(x0, y0), max(x1, y1)
-    ax1.plot([lo, hi], [lo, hi], ':', color='k', lw=0.8, label='ΔB = ΔA')
-    ax1.set_xlim(x0, x1); ax1.set_ylim(y0, y1)
-    ax1.axhline(0, color='k', lw=0.6); ax1.axvline(0, color='k', lw=0.6)
-    ax1.set_xlabel('Δ success on A (post-trained task)'); ax1.set_ylabel('Δ success on B (zero-shot)')
-    ax1.set_title('Transfer: B change vs A change\nfilled = replay, hollow = no replay; ○ N=1000, □ N=200; '
-                  '▲ PPO, ◇ iterated online (episodes)')
-    handles = [plt.Line2D([], [], marker='o', ls='', color=c, label=LABELS[m]) for m, c in COLORS.items()]
-    ax1.legend(handles=handles, fontsize=8, loc='best')
+        pts = [(n, delta(lambda s, n=n: f'{R}/m1r/s{s}/{m}/n{n}_eval.json')) for n in (200, 1000)]
+        path(ax2, pts, COLORS[m], '-', 'o', LABELS[m], annotate=lambda n: f'N={n}')
+    path(ax2, ppo, COLORS['ppo'], '-', '^', 'PPO (no replay), for reference', mfc='white', annotate=str)
+    diagonal(ax2)
+    ax2.set_title('(b) Offline on the shared A pool, with 50% replay of pretraining data\n(N = A-pool episodes)')
+    ax2.legend(fontsize=7, loc='upper left')
 
-    # ---- B learnability curves (with replay, N=1000; PPO at its largest budget with data)
-    for ax, stage, title in ((ax2, 'm1r', 'with replay'), (ax3, 'm1', 'no replay')):
-        bm = [mean_se([succ(base_learn[k][s], 'right') for s in seeds]) for k in KS]
-        if bm[0][0] is not None or bm[-1][0] is not None:
-            ax.errorbar(KS, [b[0] if b[0] is not None else np.nan for b in bm],
-                        yerr=[b[1] or 0 for b in bm], fmt='-o', color='k', lw=2, label='base policy', capsize=2)
-        for name, m, st, n, ev, jd, m3d, tag in arms(seeds):
-            if not ((st == stage and n == 1000) or (stage == 'm1' and m == 'ppo' and n == 6000)
-                    or (stage == 'm1' and st == 'm4' and n == 3000)):
-                continue
-            pts = [mean_se([succ(learn(jd[s], m3d[s], tag, k), 'right') for s in seeds]) for k in KS]
-            if all(p[0] is None for p in pts):
-                continue
-            ax.errorbar(KS, [p[0] if p[0] is not None else np.nan for p in pts], yerr=[p[1] or 0 for p in pts],
-                        fmt='-^' if m == 'ppo' else ('--D' if st == 'm4' else '-o'), color=COLORS[m], capsize=2,
-                        mfc='white' if st == 'm4' else COLORS[m], alpha=0.85,
-                        label=LABELS[m] + (' (6000 ep.)' if m == 'ppo' else
-                                           ' (online, 3000 ep.)' if st == 'm4' else ' (N=1000)'))
-        ax.set_xscale('log'); ax.set_xticks(KS); ax.set_xticklabels([str(k) for k in KS])
-        ax.xaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
-        ax.set_ylim(-0.02, 1.02)
-        ax.set_xlabel('clean B demos for fine-tuning (K)'); ax.set_ylabel('B success after fine-tuning')
-        ax.set_title(f'Learning B after post-training on A ({title})' + ('\nPPO and online arms have no replay'
-                                                                         if stage == 'm1' else ''))
-        ax.legend(fontsize=8, loc='lower right')
+    # ---- (c) learnability
+    bl = [mean_se([succ(learn(f'{R}/m0/base_s{s}', f'{R}/m3/m0/s{s}/base', 'base', k), 'right') for s in seeds])
+          for k in KS]
+    ax3.errorbar(KS, [b[0] if b[0] is not None else np.nan for b in bl], yerr=[b[1] or 0 for b in bl], fmt='-o',
+                 color='k', lw=2, capsize=2, label='base policy')
+    curves = [('m2', 'ppo', 'n6000', R + '/m2/s{s}/ppo', R + '/m3/m2/s{s}/ppo', 'PPO, 6000 ep. (no replay)', '-^')]
+    curves += [('m1r', m, 'n1000', R + '/m1r/s{s}/' + m, R + '/m3/m1r/s{s}/' + m, f'{LABELS[m]}, N=1000 (replay)',
+                '-o') for m in ('filtered_bc', 'awr', 'sft_expert', 'sft_pool')]
+    curves += [('m1', m, 'n1000', R + '/m1/s{s}/' + m, R + '/m1/s{s}/' + m, f'{LABELS[m]}, N=1000 (no replay)',
+                '--o') for m in ('filtered_bc', 'sft_expert')]
+    for stage, m, tag, jd, m3d, label, fmt in curves:
+        pts = []
+        for k in KS:
+            v = [succ(learn(jd.format(s=s), m3d.format(s=s), tag, k), 'right') for s in seeds]
+            pts.append(mean_se(v) if sum(x is not None for x in v) >= min_seeds else (None, None))
+        if all(p[0] is None for p in pts):
+            continue
+        ax3.errorbar(KS, [p[0] if p[0] is not None else np.nan for p in pts], yerr=[p[1] or 0 for p in pts],
+                     fmt=fmt, color=COLORS[m], capsize=2, alpha=0.85, label=label,
+                     mfc='white' if stage == 'm1' else COLORS[m])
+    ax3.set_xscale('log'); ax3.set_xticks(KS); ax3.set_xticklabels([str(k) for k in KS])
+    ax3.xaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
+    ax3.set_ylim(-0.02, 1.02)
+    ax3.set_xlabel('clean B demos for fine-tuning (K)'); ax3.set_ylabel('B success after fine-tuning')
+    ax3.set_title('(c) Learning B after post-training on A')
+    ax3.legend(fontsize=7, loc='upper left')
+
     fig.tight_layout()
     os.makedirs(os.path.dirname(out), exist_ok=True)
     fig.savefig(out, dpi=130)

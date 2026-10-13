@@ -459,8 +459,13 @@ def m2(seeds, ppo_spec, tag):
 @cli.command()
 @click.option('--seeds', default='0,1,2')
 @click.option('--methods', default='filtered_bc,awr')
-@click.option('--learn_ks', default='10,3,5')
-def m4(seeds, methods, learn_ks):
+@click.option('--learn_ks', default='10,3,5', help="'' to skip the learnability test")
+@click.option('--lr', default=1e-4)
+@click.option('--round_steps', default=ROUND_STEPS)
+@click.option('--episodes', default=max(ONLINE_BUDGETS))
+@click.option('--eval_at', default=','.join(map(str, ONLINE_BUDGETS)), help='Episode counts to evaluate at')
+@click.option('--tag', default='')
+def m4(seeds, methods, learn_ks, lr, round_steps, episodes, eval_at, tag):
     """Online iterated filtered BC / AWR on task A, no replay: PPO's data source and episode budgets.
 
     Each round collects ROUND_EPISODES with the current policy and fine-tunes it on everything
@@ -469,22 +474,55 @@ def m4(seeds, methods, learn_ks):
     jobs = []
     for s in map(int, seeds.split(',')):
         for m in methods.split(','):
-            job = Job(f'm4/s{s}/{m}')
+            job = Job(f'm4/s{s}/{m}{tag}')
             method = 'bc' if m == 'filtered_bc' else 'awr'
             prev, data = m_base_ckpt(s), []
-            for r in range(max(ONLINE_BUDGETS) // ROUND_EPISODES):
+            for r in range(episodes // ROUND_EPISODES):
                 rec = job.rollout(f'r{r}_rollouts', prev, 'left', ROUND_EPISODES,
                                   3_000_000 + 100_000 * s + ROUND_EPISODES * r, record=True, nut_range=None)
                 data.append({'path': rec, 'success_only': method == 'bc'})
-                prev = job.train(f'r{r}', {'method': method, 'init_ckpt': prev, 'seed': s, 'steps': ROUND_STEPS,
-                                           'lr': 1e-4, 'warmup': 100, 'batch_size': 1024, 'data': list(data)})
+                prev = job.train(f'r{r}', {'method': method, 'init_ckpt': prev, 'seed': s, 'steps': round_steps,
+                                           'lr': lr, 'warmup': min(100, round_steps // 10), 'batch_size': 1024,
+                                           'data': list(data)})
                 n = (r + 1) * ROUND_EPISODES
-                if n in ONLINE_BUDGETS:
+                if n in map(int, eval_at.split(',')):
                     job.rollout(f'n{n}_eval', prev, 'left,right', EVAL_N, EVAL_SEED, nut_range=None)
-                    for k in map(int, learn_ks.split(',')):
+                    for k in (map(int, learn_ks.split(',')) if learn_ks else []):
                         add_learn_b(job, f'n{n}', prev, s, k)
             jobs.append(job.write())
-    write_manifest(f"m4_s{seeds.replace(',', '')}", jobs)
+    write_manifest(f"m4_s{seeds.replace(',', '')}{tag}", jobs)
+
+
+# name -> (learning rate, steps, save_every, steps at which to evaluate)
+M5_SCHEDULES = {'1e-04': (1e-4, 1000, 100, (100, 200, 500, 1000)),
+                '1e-05': (1e-5, 5000, 500, (500, 1000, 2500, 5000)),
+                '1e-06': (1e-6, 10000, 1000, (1000, 3000, 6000, 10000)),
+                '1e-06early': (1e-6, 1000, 100, (100, 200, 400, 700, 1000))}   # small changes on A
+
+
+@cli.command()
+@click.option('--seeds', default='0,1,2')
+@click.option('--methods', default='filtered_bc,sft_expert')
+@click.option('--lrs', default='1e-04,1e-05,1e-06', help=f'Names in M5_SCHEDULES: {",".join(M5_SCHEDULES)}')
+def m5(seeds, methods, lrs):
+    """Update-size control: supervised post-training on A (N=1000, no replay) at smaller learning rates,
+    evaluated along the way, to compare its path in (change on A, change on B) with PPO's (lr 1e-6,
+    KL-limited updates)."""
+    jobs = []
+    for s in map(int, seeds.split(',')):
+        for m in methods.split(','):
+            for name in lrs.split(','):
+                lr, steps, every, evals = M5_SCHEDULES[name]
+                job = Job(f'm5/s{s}/{m}_lr{name}')
+                common = {'init_ckpt': m_base_ckpt(s), 'seed': s, 'steps': steps, 'lr': lr, 'warmup': min(200, steps // 10),
+                          'batch_size': 1024, 'save_every': every}
+                final = job.train('train', m_method_spec(m, 1000, common))
+                for st in evals:
+                    ckpt = final if st == steps else final.replace('final.ckpt', f'step{st}.ckpt')
+                    job.rollout(f'step{st}_eval', ckpt, 'left,right', EVAL_N, EVAL_SEED, nut_range=None)
+                jobs.append(job.write())
+    default = '1e-04,1e-05,1e-06'
+    write_manifest(f"m5_s{seeds.replace(',', '')}" + ('' if lrs == default else '_' + lrs.replace(',', '_')), jobs)
 
 
 if __name__ == '__main__':
