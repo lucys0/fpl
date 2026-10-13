@@ -113,7 +113,7 @@ def main(seeds, out, min_seeds):
         path(ax1, pts, COLORS[m], ls, 'D', f'{LABELS[m]}, iterated on own rollouts, lr {lr}', annotate=str)
     diagonal(ax1)
     ax1.set_title('(a) No replay: B vs A along training\n(grey line: ΔB = ΔA; labels: episodes)')
-    ax1.legend(fontsize=7, loc='lower left')
+    ax1.legend(fontsize=7, loc='upper left')
 
     # ---- (b) with replay: offline arms
     for m in COLORS:
