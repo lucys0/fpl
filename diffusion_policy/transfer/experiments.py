@@ -332,12 +332,19 @@ def m_base_ckpt(s):
     return f'{RUNS}/m0/base_s{s}/base/final.ckpt'
 
 
-def add_learn_b(job, tag, ckpt, seed):
-    """How well B is learned from here: SFT on LEARN_B_K clean B demos, then evaluate B."""
-    learned = job.train(f'{tag}_learnB', {'method': 'bc', 'init_ckpt': ckpt, 'seed': seed, 'steps': LEARN_B_STEPS,
-                                          'lr': 1e-4, 'warmup': 100, 'batch_size': 1024,
-                                          'data': [{'path': CLEAN_B, 'first_n': LEARN_B_K}]})
-    job.rollout(f'{tag}_learnB_eval', learned, 'right', EVAL_N, EVAL_SEED, nut_range=None)
+def add_learn_b(job, tag, ckpt, seed, k=None, udrl_mode=None):
+    """How well B is learned from here: SFT on k (default LEARN_B_K) clean B demos, then evaluate B.
+
+    A UDRL policy is fine-tuned the UDRL way, on the demos' own return condition, and evaluated at
+    the 90th percentile of it (all demos succeed), so its condition input stays meaningful."""
+    k = k or LEARN_B_K
+    name = f'{tag}_learnB' + ('' if k == LEARN_B_K else f'_k{k}')
+    spec = {'method': 'bc', 'init_ckpt': ckpt, 'seed': seed, 'steps': LEARN_B_STEPS, 'lr': 1e-4, 'warmup': 100,
+            'batch_size': 1024, 'data': [{'path': CLEAN_B, 'first_n': k}]}
+    if udrl_mode:
+        spec.update(method='udrl', udrl_mode=udrl_mode)
+    learned = job.train(name, spec)
+    job.rollout(f'{name}_eval', learned, 'right', EVAL_N, EVAL_SEED, nut_range=None)
 
 
 def m_method_spec(m, n, common):
@@ -372,7 +379,8 @@ def m0(seeds):
 @click.option('--seeds', default='0,1,2')
 @click.option('--methods', default=','.join(M_METHODS))
 @click.option('--replay/--no-replay', default=True, help='Mix the pretraining pool into post-training (50% of steps)')
-def m1(seeds, methods, replay):
+@click.option('--learn_ks', default=str(LEARN_B_K), help='Numbers of clean B demos for the learnability test')
+def m1(seeds, methods, replay, learn_ks):
     """Offline post-training on task A from the shared pool; evaluate A, B, and learning B."""
     stage = 'm1r' if replay else 'm1'
     jobs = []
@@ -387,10 +395,43 @@ def m1(seeds, methods, replay):
                 spec['data'] = spec['data'] + replay_data
                 ckpt = job.train(f'n{n}', spec)
                 job.rollout(f'n{n}_eval', ckpt, 'left,right', EVAL_N, EVAL_SEED, nut_range=None)
-                if not m.startswith('udrl'):
-                    add_learn_b(job, f'n{n}', ckpt, s)
+                for k in map(int, learn_ks.split(',')):
+                    add_learn_b(job, f'n{n}', ckpt, s, k, udrl_mode(m))
             jobs.append(job.write())
     write_manifest(f"{stage}_s{seeds.replace(',', '')}", jobs)
+
+
+def udrl_mode(method):
+    return method.split('_')[1] if method.startswith('udrl') else None
+
+
+@cli.command()
+@click.option('--stages', default='m0,m1r,m2')
+@click.option('--seeds', default='0,1,2')
+@click.option('--ks', default='3,5', help='Numbers of clean B demos to add (UDRL arms of m1r also get LEARN_B_K, '
+                                       'which the first m1r run skipped)')
+def m3(stages, seeds, ks):
+    """More B-learnability points for finished checkpoints, one job per (stage, seed, arm)."""
+    ks = [int(k) for k in ks.split(',')]
+    jobs = []
+    for stage in stages.split(','):
+        for s in map(int, seeds.split(',')):
+            if stage == 'm0':
+                units = {'base': [('base', m_base_ckpt(s), None)]}
+            elif stage == 'm2':
+                units = {'ppo': [(f'n{n}', f'{RUNS}/m2/s{s}/ppo/ppo/ppo_ep{n}.ckpt', None) for n in PPO_BUDGETS]}
+            else:
+                units = {m: [(f'n{n}', f'{RUNS}/{stage}/s{s}/{m}/n{n}/final.ckpt', udrl_mode(m)) for n in BUDGETS]
+                         for m in M_METHODS}
+            for unit, ckpts in units.items():
+                job = Job(f'm3/{stage}/s{s}/{unit}')
+                for tag, ckpt, mode in ckpts:
+                    unit_ks = ks + ([LEARN_B_K] if mode and stage == 'm1r' and LEARN_B_K not in ks else [])
+                    for k in unit_ks:
+                        add_learn_b(job, tag, ckpt, s, k, mode)
+                src = Job(f'm0/base_s{s}' if stage == 'm0' else f'{stage}/s{s}/{unit}')
+                jobs.append({**job.write(), 'source': {'name': src.name, 'dir': src.dir}})
+    write_manifest(f"m3_{stages.replace(',', '')}_s{seeds.replace(',', '')}", jobs)
 
 
 @cli.command()

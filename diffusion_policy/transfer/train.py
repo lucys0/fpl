@@ -159,8 +159,9 @@ def main(spec_path):
 
     if spec.get('init_ckpt'):
         policy, ema_policy, payload = load_checkpoint(spec['init_ckpt'])
-        assert payload['extra_cond_dim'] == 0, "fine-tuning starts from a goal-only policy"
-        policy, ema_policy = widen_cond(policy, extra_dim), widen_cond(ema_policy, extra_dim)
+        if payload['extra_cond_dim'] != extra_dim:      # e.g. UDRL fine-tuning of a goal-only policy
+            assert payload['extra_cond_dim'] == 0, "can only widen a goal-only policy"
+            policy, ema_policy = widen_cond(policy, extra_dim), widen_cond(ema_policy, extra_dim)
     else:
         policy = build_policy(extra_dim)
         ema_policy = None
@@ -184,8 +185,10 @@ def main(spec_path):
             p.normalizer['weight'] = get_identity_normalizer_from_stat(stat)
     policy.to(device); ema_policy.to(device)
 
-    loader = torch.utils.data.DataLoader(dataset, batch_size=spec.get('batch_size', 1024), shuffle=True,
-                                         num_workers=4, pin_memory=True, persistent_workers=True, drop_last=True)
+    # a dataset smaller than one batch (e.g. a single demo) trains full-batch instead of yielding no batches
+    batch_size = spec.get('batch_size', 1024)
+    loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True,
+                                         persistent_workers=True, drop_last=len(dataset) >= batch_size)
     steps = spec['steps']
     optimizer = policy.get_optimizer(weight_decay=1e-3, learning_rate=spec.get('lr', 2e-4), betas=(0.9, 0.95))
     scheduler = get_scheduler('cosine', optimizer=optimizer, num_warmup_steps=spec.get('warmup', 500),

@@ -22,8 +22,11 @@ ROOT = '/iris/u/lucyshi/fpl_transfer'
 REPO = '/iris/u/lucyshi/fpl/diffusion_policy'
 I = '/iris/u/lucyshi'
 # iris4: small GPUs; iris8: GPU driver hung on 2026-10-12 (CUDA init blocks in the NVIDIA driver);
-# iris-hgx-*: H100/H200 (sm_90), which the pinned torch 1.12 + CUDA 11.6 has no kernels for
-EXCLUDE = 'iris4,iris8,iris-hgx-1,iris-hgx-2'
+# iris-hgx-*: H100/H200 (sm_90), which the pinned torch 1.12 + CUDA 11.6 has no kernels for;
+# iris1: failed the GPU check on every job of 2026-10-12. The rest are sc-freegpu nodes that don't
+# mount /iris (orion-dgx) or weren't checked; macondo[1-2] and deep[17-25] were.
+EXCLUDE = ('iris1,iris4,iris8,iris-hgx-1,iris-hgx-2,'
+           'orion-dgx,dawn[1-8],dawn[10-18],britten[1-2],charlotte,macondo-dgx1,visionlab-dgx1')
 
 WRAPPER = f'''#!/bin/bash
 #SBATCH --account=iris
@@ -68,7 +71,9 @@ def snapshot_code():
 @click.option('--release_held', is_flag=True, help='Exclude recorded bad nodes from held jobs and release them')
 @click.option('--after', default='', help='Comma-separated Slurm job ids every submitted job also waits for (afterok)')
 @click.option('--cpus', default=None, type=int, help='Override CPUs per job (default 32), e.g. 64 for 60 PPO envs')
-def main(manifest, hi, release_held, after, cpus):
+@click.option('--free', is_flag=True, help='Also allow the sc-freegpu partition (slower GPUs, 8-12 CPUs per node); '
+                                           'implies 8 CPUs unless --cpus is given')
+def main(manifest, hi, release_held, after, cpus, free):
     if release_held:
         out = subprocess.run(['squeue', '-u', os.environ['USER'], '-h', '-t', 'PD', '-o', '%i|%r'],
                              capture_output=True, text=True).stdout
@@ -94,14 +99,32 @@ def main(manifest, hi, release_held, after, cpus):
             print(f"skip {job['name']} (done)")
             continue
         deps = [ids[a] for a in job['after'] if a in ids] + [a for a in after.split(',') if a]
+        if 'source' in job and not os.path.exists(f"{job['source']['dir']}/DONE"):
+            # a job from an earlier submission whose outputs this one needs: wait for it if it's still queued
+            q = subprocess.run(['squeue', '-u', os.environ['USER'], '-h', '-n', job['source']['name'], '-o', '%i'],
+                               capture_output=True, text=True).stdout.split()
+            if not q:
+                print(f"skip {job['name']}: {job['source']['name']} is neither done nor queued")
+                continue
+            deps += q
         partition = 'iris-hi' if submitted < hi else 'iris'
+        if free:
+            partition += ',sc-freegpu'
+            cpus = cpus or 8
         cmd = ['sbatch', '--parsable', '-p', partition, f'--exclude={EXCLUDE}', '-J', job['name'],
                '-o', f"{job['dir']}/slurm-%j.out"]
         if deps:
             cmd.append('--dependency=afterok:' + ':'.join(deps))
         if cpus:
             cmd += [f'--cpus-per-task={cpus}', f'--mem={2 * cpus}G']
-        jobid = subprocess.run(cmd + [wrapper, job['dir']], capture_output=True, text=True, check=True).stdout.strip()
+        r = subprocess.run(cmd + [wrapper, job['dir']], capture_output=True, text=True)
+        if r.returncode and free and 'QOSMaxSubmitJobPerUserLimit' in r.stderr:   # iris submit cap: free partition only
+            partition = 'sc-freegpu'
+            cmd[cmd.index('-p') + 1] = partition
+            r = subprocess.run(cmd + [wrapper, job['dir']], capture_output=True, text=True)
+        if r.returncode:
+            raise RuntimeError(f"sbatch failed for {job['name']}: {r.stderr.strip()}")
+        jobid = r.stdout.strip()
         ids[job['name']] = jobid
         submitted += 1
         print(f"{jobid} {partition:8s} {job['name']}" + (f" (after {','.join(deps)})" if deps else ''))
