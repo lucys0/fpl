@@ -125,13 +125,13 @@ def e1_dir(s, c, k):
 @cli.command()
 @click.option('--seeds', default='1,2,0')
 @click.option('--chains', default=4)
-@click.option('--episodes', default=65536)
+@click.option('--episodes', default=32768)
 @click.option('--lr', type=float, default=3e-6)
 @click.option('--per_job', default=1)
 def e1(seeds, chains, episodes, lr, per_job):
     """PPO on the first K tasks of each balanced chain (K = 1, 2, 4, 8) and on all 16 (two PPO seeds); the same
     total episodes for every K. Jobs are ordered chain by chain across seeds, so complete K-curves finish first."""
-    save_at = [episodes // 16, episodes // 8, episodes // 4, episodes // 2, episodes]
+    save_at = [episodes // 8, episodes // 4, episodes // 2, episodes]
     seeds = [int(s) for s in seeds.split(',')]
     jobs = []
     for c in range(chains):
@@ -174,7 +174,7 @@ def offline_job(name, spec, after, eval_tasks='all'):
 
 @cli.command()
 @click.option('--seeds', default='0,1,2')
-@click.option('--episodes', default=65536)
+@click.option('--episodes', default=32768)
 @click.option('--lr', default=1e-6)
 def e2(seeds, episodes, lr):
     """Same data, different update rule: filtered BC on each logged PPO run's successful episodes, and SFT
@@ -187,7 +187,8 @@ def e2(seeds, episodes, lr):
             tasks = SPLITS['R'] if k == 16 else chain(s, c)[:k]
             common = {'init_ckpt': base_ckpt(s), 'seed': s, 'lr': lr, 'method': 'bc'}
             jobs.append(offline_job(f'e2/s{s}/{tag}/filtered_bc', {**common, 'data': [
-                {'glob': f'{src}/rollouts_*.npz', 'success_only': True}]}, after=[job_of(src)], eval_tasks='all'))
+                {'glob': f'{src}/rollouts_*.npz', 'max_end': episodes, 'success_only': True}]},
+                after=[job_of(src)], eval_tasks='all'))
             jobs.append(offline_job(f'e2/s{s}/{tag}/sft_expert', {**common, 'data': [
                 {'path': EXPERT, 'tasks': [int(t) for t in tasks]}]}, after=[f'base-s{s}'], eval_tasks='all'))
     write_manifest(f"e2_s{seeds.replace(',', '')}", jobs)
@@ -199,7 +200,7 @@ LEARN_STEPS = 2000
 
 @cli.command()
 @click.option('--seeds', default='0,1,2')
-@click.option('--episodes', default=65536)
+@click.option('--episodes', default=32768)
 def e3(seeds, episodes):
     """Learnability of the 8 never-seen tasks (U): SFT on the first k clean demos of each U task (2000 steps,
     lr 1e-4, as robomimic's learn-B recipe) from the base and from PPO on K = 1, 4 (chain 0) and 16 tasks.

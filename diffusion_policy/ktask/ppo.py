@@ -90,7 +90,17 @@ def main(spec_path):
     spec = json.load(open(spec_path))
     out_dir = spec['out_dir']
     os.makedirs(out_dir, exist_ok=True)
-    log_f = open(os.path.join(out_dir, 'ppo_log.txt'), 'a')
+    if os.path.exists(os.path.join(out_dir, f"ppo_ep{spec['episodes']}.ckpt")):   # trained already: evaluations only
+        if spec.get('eval'):
+            os.execv(sys.executable, [sys.executable, '-m', 'ktask.finish_evals', out_dir])
+        return
+    log_path = os.path.join(out_dir, 'ppo_log.txt')
+    if os.path.exists(log_path) and not os.path.exists(os.path.join(out_dir, 'resume.pt')):
+        k = 1                                   # a fresh start after an attempt that left no resume point
+        while os.path.exists(os.path.join(out_dir, f'ppo_log.attempt{k}.txt')):
+            k += 1
+        os.replace(log_path, os.path.join(out_dir, f'ppo_log.attempt{k}.txt'))
+    log_f = open(log_path, 'a')
 
     def log(msg):
         line = f"[{time.strftime('%H:%M:%S')}] {msg}"
@@ -98,10 +108,6 @@ def main(spec_path):
         log_f.write(line + '\n')
         log_f.flush()
 
-    if os.path.exists(os.path.join(out_dir, f"ppo_ep{spec['episodes']}.ckpt")):   # trained already: evaluations only
-        if spec.get('eval'):
-            os.execv(sys.executable, [sys.executable, '-m', 'ktask.finish_evals', out_dir])
-        return
     seed = spec.get('seed', 0)
     torch.manual_seed(seed)
     np.random.seed(seed)

@@ -59,7 +59,7 @@ def run_batch(env, act_fn, max_steps=MAX_STEPS):
     return steps >= 0, steps, lifted
 
 
-def evaluate(policy, tasks, n, slots, seed=EVAL_SEED, log=print):
+def evaluate(policy, tasks, n, slots, seed=EVAL_SEED, log=print, sigma=0.0):
     ids = [t for t in tasks for _ in range(slots)]
     env = make_env(ids)
     u = env.unwrapped
@@ -70,7 +70,13 @@ def evaluate(policy, tasks, n, slots, seed=EVAL_SEED, log=print):
     for b in range((n + slots - 1) // slots):
         env.reset(seed=[seed + 1000 * t + b * slots + i % slots for i, t in enumerate(ids)])
         gen.manual_seed(seed + b)
-        succ, steps, lifted = run_batch(env, lambda h: policy.sample(h, gen))
+        if sigma > 0:                     # PPO's stochastic chain (noise sigma after every Euler step)
+            from ktask.ppo import Actor
+            actor = Actor(policy, sigma, [0, 10])
+            act = lambda h: actor.sample(policy.cond(h), gen)[0]
+        else:
+            act = lambda h: policy.sample(h, gen)
+        succ, steps, lifted = run_batch(env, act)
         succ, steps, lifted = succ.cpu().numpy(), steps.cpu().numpy(), lifted.cpu().numpy()
         for i, t in enumerate(ids):
             if b * slots + i % slots < n:
@@ -89,10 +95,11 @@ def evaluate(policy, tasks, n, slots, seed=EVAL_SEED, log=print):
 @click.option('--n', default=128, help='episodes per task')
 @click.option('--slots', default=32, help='env slots per task')
 @click.option('--seed', default=EVAL_SEED)
-def main(ckpt, out, tasks, n, slots, seed):
+@click.option('--sigma', default=0.0, help="evaluate PPO's stochastic policy (chain noise) instead")
+def main(ckpt, out, tasks, n, slots, seed, sigma):
     tasks = parse_tasks(tasks)
     policy, _ = load_checkpoint(ckpt, 'cuda')
-    res = evaluate(policy, tasks, n, min(slots, n), seed)
+    res = evaluate(policy, tasks, n, min(slots, n), seed, sigma=sigma)
     for t in tasks:
         r = res[t]
         print(f"{t:2d} {task_name(t):18s} success {np.mean(r['success']):.2f} lifted {np.mean(r['lifted']):.2f}")

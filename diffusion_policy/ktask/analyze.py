@@ -162,6 +162,56 @@ def fmt_runs(per_run, metric='success'):
     return f'{point:+.3f} [{lo:+.3f}, {hi:+.3f}]'
 
 
+def phase_table(budget):
+    """Held-out tasks (H and the rest of R): change in P(lifted) and in P(success | lifted) per K."""
+    rows = {}
+    for s, c, k, d, train in e1_runs():
+        e, b = load_eval(f'{d}/eval_ep{budget}.json'), base_eval(s)
+        if e is None or b is None:
+            continue
+        held = SPLITS['H'] + [t for t in SPLITS['R'] if t not in train]
+        out = {}
+        for name, ts in (('train', train), ('held', held), ('U', SPLITS['U'])):
+            dl = np.mean([e[t]['lifted'].mean() - b[t]['lifted'].mean() for t in ts])
+            cond = lambda r: r['success'][r['lifted']].mean() if r['lifted'].any() else np.nan
+            dc = np.nanmean([cond(e[t]) - cond(b[t]) for t in ts])
+            out[name] = (dl, dc)
+        rows.setdefault(k, []).append(out)
+    lines = ['| K | runs | training: lifted | training: success if lifted | held out: lifted | '
+             'held out: success if lifted | U: lifted | U: success if lifted |', '|' + '---|' * 8]
+    for k in sorted(rows):
+        cells = [str(k), str(len(rows[k]))]
+        for name in ('train', 'held', 'U'):
+            for i in (0, 1):
+                cells.append(f"{np.nanmean([r[name][i] for r in rows[k]]):+.3f}")
+        lines.append('| ' + ' | '.join(cells) + ' |')
+    return '\n'.join(lines)
+
+
+def speed_table(budget):
+    """Relative change in steps to success, on start states where both the base and the run succeed."""
+    rows = {}
+    for s, c, k, d, train in e1_runs():
+        e, b = load_eval(f'{d}/eval_ep{budget}.json'), base_eval(s)
+        if e is None or b is None:
+            continue
+        held = SPLITS['H'] + [t for t in SPLITS['R'] if t not in train]
+        out = {}
+        for name, ts in (('train', train), ('held', held), ('U', SPLITS['U'])):
+            rel = []
+            for t in ts:
+                both = e[t]['success'] & b[t]['success']
+                if both.sum() >= 5:
+                    rel.append(e[t]['steps'][both].mean() / b[t]['steps'][both].mean() - 1)
+            out[name] = np.mean(rel) if rel else np.nan
+        rows.setdefault(k, []).append(out)
+    lines = ['| K | runs | training tasks | held out (H + rest of R) | U |', '|---|---|---|---|---|']
+    for k in sorted(rows):
+        lines.append(f'| {k} | {len(rows[k])} | ' + ' | '.join(
+            f"{100 * np.nanmean([r[n] for r in rows[k]]):+.1f}%" for n in ('train', 'held', 'U')) + ' |')
+    return '\n'.join(lines)
+
+
 @cli.command()
 @click.option('--budgets', default='4096,8192,16384,32768,65536')
 @click.option('--out', default=None)
@@ -170,7 +220,104 @@ def e1(budgets, out):
     for n in map(int, budgets.split(',')):
         text.append(f'\n### After {n} PPO episodes (change in success vs the base; 95% CI over runs and start states)\n')
         text.append(e1_table(n))
+        text.append(f'\nWhere the change comes from (mean over runs): grasp (lifted) vs after the grasp\n')
+        text.append(phase_table(n))
+        text.append(f'\nSpeed: change in steps to success where both the base and the run succeed (mean over runs)\n')
+        text.append(speed_table(n))
     text = '\n'.join(text)
+    print(text)
+    if out:
+        open(out, 'w').write(text + '\n')
+
+
+E2_ARMS = (('ppo', 'PPO', [4096, 8192, 16384, 32768], 'eval_ep{}.json'),
+           ('filtered_bc', "filtered BC on PPO's episodes", [1000, 3000, 6000, 10000], 'eval_step{}.json'),
+           ('sft_expert', 'SFT on clean expert demos', [1000, 3000, 6000, 10000], 'eval_step{}.json'))
+
+
+def e2_points(k):
+    """{arm: [(point label, [per-run dicts of group deltas])]} for E2 sources with K tasks."""
+    out = {}
+    for s, c, kk, d, train in e1_runs():
+        if kk != k or not os.path.exists(f'{d}/ppo.json') or not json.load(open(f'{d}/ppo.json')).get('log_rollouts'):
+            continue
+        tag = 'k16' if k == 16 else f'c{c}/k{k}'
+        b = base_eval(s)
+        for arm, _, points, pat in E2_ARMS:
+            run_dir = d if arm == 'ppo' else f'{RUNS}/e2/s{s}/{tag}/{arm}'
+            for p in points:
+                e = load_eval(f'{run_dir}/{pat.format(p)}')
+                if e is None or b is None:
+                    continue
+                held = SPLITS['H'] + [t for t in SPLITS['R'] if t not in train]
+                g = {'train': train, 'held': held, 'H': SPLITS['H'], 'U': SPLITS['U']}
+                out.setdefault(arm, {}).setdefault(p, []).append(
+                    {n: float(np.mean([e[t]['success'].mean() - b[t]['success'].mean() for t in ts])) for n, ts in g.items()})
+    return out
+
+
+@cli.command()
+@click.option('--out', default=None)
+def e2(out):
+    lines = []
+    for k in (1, 4, 16):
+        pts = e2_points(k)
+        if not pts:
+            continue
+        lines.append(f'\n### K = {k}: change vs the base (mean over runs)\n')
+        lines.append('| arm | point | runs | training tasks | held out (H + rest of R) | H | U |')
+        lines.append('|---|---|---|---|---|---|---|')
+        for arm, label, points, _ in E2_ARMS:
+            for p in points:
+                rs = pts.get(arm, {}).get(p)
+                if not rs:
+                    continue
+                m = {n: np.mean([r[n] for r in rs]) for n in ('train', 'held', 'H', 'U')}
+                unit = 'episodes' if arm == 'ppo' else 'steps'
+                lines.append(f"| {label} | {p} {unit} | {len(rs)} | {m['train']:+.3f} | {m['held']:+.3f} | "
+                             f"{m['H']:+.3f} | {m['U']:+.3f} |")
+    text = '\n'.join(lines)
+    print(text)
+    if out:
+        open(out, 'w').write(text + '\n')
+
+
+@cli.command()
+@click.option('--episodes', default=32768)
+@click.option('--out', default=None)
+def e3(episodes, out):
+    """Learning the never-seen tasks U from k clean demos each, from the base and from PPO on K tasks:
+    U success before (zero-shot) and after, and H after (kept), paired against the base start."""
+    starts = (('base', 'base'), ('ppo_k1', 'PPO on 1 task'), ('ppo_k4', 'PPO on 4 tasks'), ('ppo_k16', 'PPO on 16 tasks'))
+    lines = ['| start | U zero-shot | U after 5 demos | vs base start | U after 20 demos | vs base start | '
+             'H after 20 demos | vs base start |', '|---|---|---|---|---|---|---|---|']
+    for key, label in starts:
+        zs, cells = [], {5: [], 20: []}
+        held = []
+        for s in (0, 1, 2):
+            b0 = base_eval(s)
+            if key == 'base':
+                z = b0
+            else:
+                k = int(key.split('k')[1])
+                from ktask.experiments import e1_dir
+                z = load_eval(f'{e1_dir(s, 0, k)}/eval_ep{episodes}.json')
+            if z is not None and b0 is not None:
+                zs.append(np.mean([z[t]['success'].mean() for t in SPLITS['U']]))
+            for kd in (5, 20):
+                e = load_eval(f'{RUNS}/e3/s{s}/{key}/k{kd}/eval.json')
+                eb = load_eval(f'{RUNS}/e3/s{s}/base/k{kd}/eval.json')
+                if e is None or eb is None:
+                    continue
+                cells[kd].append((np.mean([e[t]['success'].mean() for t in SPLITS['U']]),
+                                  np.mean([e[t]['success'].mean() - eb[t]['success'].mean() for t in SPLITS['U']])))
+                if kd == 20:
+                    held.append((np.mean([e[t]['success'].mean() for t in SPLITS['H']]),
+                                 np.mean([e[t]['success'].mean() - eb[t]['success'].mean() for t in SPLITS['H']])))
+        f = lambda v, i: f'{np.mean([x[i] for x in v]):.2f}' if v and i == 0 else (f'{np.mean([x[i] for x in v]):+.3f}' if v else '-')
+        lines.append(f"| {label} | {np.mean(zs):.2f} (n={len(zs)}) | {f(cells[5], 0)} | {f(cells[5], 1)} | "
+                     f"{f(cells[20], 0)} | {f(cells[20], 1)} | {f(held, 0)} | {f(held, 1)} |" if zs else f'| {label} | - |')
+    text = '\n'.join(lines)
     print(text)
     if out:
         open(out, 'w').write(text + '\n')

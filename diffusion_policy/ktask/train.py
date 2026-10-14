@@ -93,6 +93,8 @@ def main(spec_path):
     data = []
     for ds in spec['data']:                 # "glob": every matching file (e.g. a PPO run's rollout parts)
         paths = sorted(glob.glob(ds['glob'])) if ds.get('glob') else [ds['path']]
+        if ds.get('max_end') is not None:   # rollout parts rollouts_<a>_<b>.npz with b <= max_end
+            paths = [p for p in paths if int(os.path.basename(p)[:-4].split('_')[-1]) <= ds['max_end']]
         assert paths, ds
         data += [{**ds, 'path': p} for p in paths]
     for ds in data:

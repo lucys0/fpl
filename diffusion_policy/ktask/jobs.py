@@ -22,8 +22,9 @@ ROOT = '/iris/u/lucyshi/fpl_transfer/ktask'
 REPO = '/iris/u/lucyshi/fpl/diffusion_policy'
 I = '/iris/u/lucyshi'
 PY = f'{I}/maniskill/.venv/bin/python'
-# GPUs the ManiSkill GPU simulation was checked on (see logs/gputest); others are excluded
-EXCLUDE = 'iris4'
+# iris4: small GPUs. iris[1-3] (TITAN RTX) and iris-hp-z8 (RTX 8000): PPO iterations 3-7 min vs ~1 min on
+# L40S/H100 (2026-10-14), so a 64-iteration run can exceed the time limit
+EXCLUDE = 'iris[1-4],iris-hp-z8'
 
 WRAPPER = f'''#!/bin/bash
 #SBATCH --account=iris
@@ -127,6 +128,8 @@ def submit(manifests, max_iris, max_hi, dry):
     sent = 0
     for m, j in jobs:
         if j.get('external') or done(j['dir']) or j['name'] in q:     # external: runs elsewhere (iris-ws-4)
+            continue
+        if os.path.exists(f"{j['dir']}/CLAIMED"):                     # taken by a worker outside Slurm
             continue
         if any(not done(dirs.get(a, '/nonexistent')) for a in j['after']):
             continue
