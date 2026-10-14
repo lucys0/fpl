@@ -113,6 +113,25 @@ def section_a():
               f'vs the A-only base at the same k', ['start'] + [f'k={k}' for k in ks], rows)
 
 
+def section_a3(k=5):
+    """PPO on B from each A-only start, after SFT on k clean B demos."""
+    for task, tname in (('right', 'B1 = right peg'), ('round', 'B2 = round nut')):
+        rows = []
+        for key, name in (('base', 'A-only base'), ('ppoA6000', 'PPO on A'), ('sft_expert', 'SFT on A')):
+            warm = lambda s, key=key: f'{R}/a2/s{s}/{key}/{task}/eval_k{k}/eval.json'
+            warm_ref = lambda s: f'{R}/a2/s{s}/base/{task}/eval_k{k}/eval.json'
+            row = [name, fmt(stat(warm, task, None if key == 'base' else warm_ref))]
+            for n in (200, 1000, 3000):
+                p = lambda s, n=n, key=key: f'{R}/a3/s{s}/{key}/{task}_k{k}/eval_n{n}/eval.json'
+                ref = None if key == 'base' else (lambda s, n=n: f'{R}/a3/s{s}/base/{task}_k{k}/eval_n{n}/eval.json')
+                row.append(fmt(stat(p, task, ref)))
+            p = lambda s, key=key: f'{R}/a3/s{s}/{key}/{task}_k{k}/eval_n3000/eval.json'
+            row.append(fmt(stat(p, 'left'), False))
+            rows.append(row)
+        table(f'B never in pretraining: PPO on {tname} after SFT on {k} clean demos (vs from the A-only base)',
+              ['start', f'B after {k} demos', 'B after 200 PPO ep.', '1000', '3000', 'A after 3000'], rows)
+
+
 # ---------------------------------------------------------------- second pair: learning the round nut
 
 def section_xlearn():
@@ -255,7 +274,7 @@ def section_xpeg():
 @click.command()
 @click.option('--sections', default='a,xlearn,logged,time,xppob,probes,xpeg')
 def main(sections):
-    fns = {'a': section_a, 'xlearn': section_xlearn, 'logged': section_logged, 'time': section_time,
+    fns = {'a': section_a, 'a3': section_a3, 'xlearn': section_xlearn, 'logged': section_logged, 'time': section_time,
            'xppob': section_xppob, 'probes': section_probes, 'xpeg': section_xpeg}
     for name in sections.split(','):
         fns[name]()

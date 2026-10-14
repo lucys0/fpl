@@ -22,9 +22,17 @@ import click
 STALE = 300          # seconds without a refresh before a claim counts as abandoned
 
 
+def expand(args):
+    """Manifest paths; an argument ending in .txt lists manifests, one per line (reread every loop)."""
+    out = []
+    for a in args:
+        out += [l.strip() for l in open(a) if l.strip()] if a.endswith('.txt') else [a]
+    return out
+
+
 def load(manifests):
     jobs, dirs = [], {}
-    for m in manifests:
+    for m in expand(manifests):
         for j in json.load(open(m)):
             dirs[j['name']] = j['dir']
             if j.get('kind') == 'cpu':

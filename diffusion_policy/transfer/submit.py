@@ -191,6 +191,9 @@ def main(manifests, hi, release_held, after, cpus, free, top_up, max_iris, max_h
             print(f'released {jobid} ({job_dir}) excluding {bad}')
         return
 
+    pilot_args = list(manifests)                   # pilots get the original arguments (a .txt list is reread)
+    manifests = [l.strip() for a in manifests for l in (open(a) if a.endswith('.txt') else [a]) if l.strip()]
+    all_dirs = {j['name']: j['dir'] for m in manifests for j in json.load(open(m))}   # dependencies across manifests
     queue = my_queue() if top_up else {}
     use_pilots = top_up and (pilots or free_pilots)
     if use_pilots:
@@ -200,7 +203,7 @@ def main(manifests, hi, release_held, after, cpus, free, top_up, max_iris, max_h
     total = 0
     for manifest in manifests:
         jobs = json.load(open(manifest))
-        dirs = {j['name']: j['dir'] for j in jobs}
+        dirs = all_dirs
         snap = stage_snapshot(manifest) if top_up else snapshot_code()
         wrapper, cpu_wrapper = f'{snap}/job.sbatch', f'{snap}/cpu.sbatch'
         if not top_up:
@@ -313,7 +316,7 @@ def main(manifests, hi, release_held, after, cpus, free, top_up, max_iris, max_h
                 continue
             r = subprocess.run(['sbatch', '--parsable', '-p', part, f'--exclude={exclude}', '-J', name, '--time=03:00:00',
                                 f'--cpus-per-task={n_cpus}', f'--mem={2 * n_cpus}G', '-o', f'{ROOT}/pilots/%x-%j.out',
-                                script, *manifests, '--slot_cpus', str(slot), '--idle_exit', '2400'],
+                                script, *pilot_args, '--slot_cpus', str(slot), '--idle_exit', '2400'],
                                capture_output=True, text=True)
             if r.returncode:
                 print(f"pilot {name} not submitted: {r.stderr.strip()}")

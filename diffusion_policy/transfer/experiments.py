@@ -790,6 +790,24 @@ def a(seeds, ks):
     write_manifest(f"a_s{seeds.replace(',', '')}", jobs)
 
 
+@cli.command()
+@click.option('--seeds', default='0,1,2')
+@click.option('--starts', default='base,ppoA6000,sft_expert')
+@click.option('--k_right', default=10, help='clean demos of the right-peg task before PPO (from stage a2)')
+@click.option('--k_round', default=10, help='clean demos of the round-nut task before PPO (from stage a2)')
+def a3(seeds, starts, k_right, k_round):
+    """B never in pretraining: PPO on B from each A-pretrained start, after SFT on k clean B demos (a sparse
+    reward needs some successes to start from); evaluated on A and B at 200 / 1000 / 3000 episodes."""
+    jobs = []
+    for s in map(int, seeds.split(',')):
+        for start in starts.split(','):
+            for task, k in (('right', k_right), ('round', k_round)):
+                warm = f'{RUNS}/a2/s{s}/{start}/{task}/k{k}/final.ckpt'
+                jobs += ppo_stage(f'a3/s{s}/{start}/{task}_k{k}', warm, task, s, B_PPO_BUDGETS, f'left,{task}',
+                                  after=[f'a2-s{s}-{start}-{task}'])[0]
+    write_manifest(f"a3_s{seeds.replace(',', '')}_k{k_right}_{k_round}", jobs)
+
+
 def x_starts(s):
     return {'base': x_base_ckpt(s), 'ppoA6000': f'{RUNS}/x2/s{s}/ppo/ppo/ppo_ep6000.ckpt',
             'sft_expert_r1000': f'{RUNS}/x1r/s{s}/sft_expert/n1000/final.ckpt',
