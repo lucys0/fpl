@@ -185,11 +185,9 @@ def e2(seeds, episodes, lr):
             src = e1_dir(s, c, k)
             tag = 'k16' if k == 16 else f'c{c}/k{k}'
             tasks = SPLITS['R'] if k == 16 else chain(s, c)[:k]
-            parts = [f'{src}/rollouts_{a}_{b}.npz' for a, b in
-                     zip([0] + [episodes // 16 * m for m in (1, 2, 4, 8)], [episodes // 16 * m for m in (1, 2, 4, 8, 16)])]
             common = {'init_ckpt': base_ckpt(s), 'seed': s, 'lr': lr, 'method': 'bc'}
             jobs.append(offline_job(f'e2/s{s}/{tag}/filtered_bc', {**common, 'data': [
-                {'path': p, 'success_only': True} for p in parts]}, after=[job_of(src)], eval_tasks='all'))
+                {'glob': f'{src}/rollouts_*.npz', 'success_only': True}]}, after=[job_of(src)], eval_tasks='all'))
             jobs.append(offline_job(f'e2/s{s}/{tag}/sft_expert', {**common, 'data': [
                 {'path': EXPERT, 'tasks': [int(t) for t in tasks]}]}, after=[f'base-s{s}'], eval_tasks='all'))
     write_manifest(f"e2_s{seeds.replace(',', '')}", jobs)

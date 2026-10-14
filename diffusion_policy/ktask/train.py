@@ -3,7 +3,7 @@ Train or fine-tune the flow policy on recorded episodes. One JSON spec per run:
 
   {"out_dir": ..., "init_ckpt": null or path,
    "method": "bc" | "awr",                     # SFT and filtered BC are both "bc"
-   "data": [{"path": ..., "tasks": "RH" or [ids], "first_n": null, "success_only": false,
+   "data": [{"path": ... (or "glob": pattern), "tasks": "RH" or [ids], "first_n": null, "success_only": false,
              "fastest_frac": null, "replay": false}, ...],
    "replay_frac": 0.5,                         # share of each batch drawn from "replay" data
    "steps": 40000, "lr": 2e-4, "warmup": 500, "batch_size": 1024, "seed": 0, "save_at": [...],
@@ -17,6 +17,7 @@ Resumes from resume.pt after preemption.
   python -m ktask.train spec.json
 """
 
+import glob
 import json
 import os
 import sys
@@ -89,7 +90,12 @@ def main(spec_path):
 
     groups = {False: [], True: []}
     n_eps = {False: 0, True: 0}
-    for ds in spec['data']:
+    data = []
+    for ds in spec['data']:                 # "glob": every matching file (e.g. a PPO run's rollout parts)
+        paths = sorted(glob.glob(ds['glob'])) if ds.get('glob') else [ds['path']]
+        assert paths, ds
+        data += [{**ds, 'path': p} for p in paths]
+    for ds in data:
         d = load_episodes(ds['path'])
         tasks = parse_tasks(ds['tasks']) if ds.get('tasks') is not None else None
         idx = select(d, tasks, ds.get('success_only', False), ds.get('first_n'), ds.get('fastest_frac'))

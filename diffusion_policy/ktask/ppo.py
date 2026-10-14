@@ -20,7 +20,9 @@ equal shares of the episode budget. Advantages are normalized over the whole bat
    "log_rollouts": false, "eval": {"tasks": "all", "n": 128}}
 Saves ppo_ep<N>.ckpt at each save_at episode count (the ktask.train format) and, with "eval", evaluates each
 one in a separate process (eval_ep<N>.json). With log_rollouts, every training episode is written to
-rollouts_<M>_<N>.npz (episodes M+1..N, the ktask.data format) so offline methods can train on PPO's data.
+rollouts_<M>_<N>.npz (episodes M+1..N, the ktask.data format, every resume_every episodes) so offline
+methods can train on PPO's data. Every resume_every episodes it also writes resume.pt; a requeued job
+continues from there, and evaluations lost with the preempted job are rerun at the end.
 """
 
 import json
@@ -96,6 +98,10 @@ def main(spec_path):
         log_f.write(line + '\n')
         log_f.flush()
 
+    if os.path.exists(os.path.join(out_dir, f"ppo_ep{spec['episodes']}.ckpt")):   # trained already: evaluations only
+        if spec.get('eval'):
+            os.execv(sys.executable, [sys.executable, '-m', 'ktask.finish_evals', out_dir])
+        return
     seed = spec.get('seed', 0)
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -121,9 +127,23 @@ def main(spec_path):
     step_cost = spec.get('time_cost', 0.0) * N_ACT / MAX_STEPS
     gamma, lam, clip = spec.get('gamma', 0.99), spec.get('lam', 0.95), spec.get('clip', 0.1)
     save_at = sorted(spec.get('save_at', [spec['episodes']]))
+    all_saves = list(save_at)
     log_rollouts, logged, logged_from = spec.get('log_rollouts', False), [], 0
+    resume_every = spec.get('resume_every', 4096)          # episodes between resume points (and rollout parts)
     evals = []
     episodes_done, it, t0 = 0, 0, time.time()
+    resume = os.path.join(out_dir, 'resume.pt')
+    if os.path.exists(resume):                              # preempted and requeued: continue where it stopped
+        r = torch.load(resume, map_location=device, weights_only=False)
+        policy.load_state_dict(r['policy'])
+        critic.load_state_dict(r['critic'])
+        opt_actor.load_state_dict(r['opt_actor'])
+        opt_critic.load_state_dict(r['opt_critic'])
+        gen.set_state(r['gen'].cpu())
+        episodes_done, it = r['episodes_done'], r['it']
+        logged_from = episodes_done
+        save_at = [n for n in save_at if n > episodes_done]
+        log(f'resumed at {episodes_done} episodes (iteration {it})')
     log(f"PPO on {len(tasks)} tasks ({', '.join(task_name(t) for t in tasks)}), {n_envs} slots, "
         f"{spec['episodes']} episodes")
 
@@ -259,30 +279,39 @@ def main(spec_path):
             f"update {time.time() - t_iter - t_roll:.0f} s, {(time.time() - t0) / 60:.1f} min, "
             f"GPU mem {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB")
 
+        if log_rollouts and (episodes_done % resume_every == 0 or episodes_done >= spec['episodes']):
+            part = os.path.join(out_dir, f'rollouts_{logged_from}_{episodes_done}.npz')
+            save_episodes(part, logged, meta={'spec': spec})
+            log(f"wrote {len(logged)} episodes ({np.mean([e['success'] for e in logged]):.2f} successful) to {part}")
+            logged, logged_from = [], episodes_done
         while save_at and episodes_done >= save_at[0]:
             n_ep = save_at.pop(0)
             path = os.path.join(out_dir, f'ppo_ep{n_ep}.ckpt')
             save_checkpoint(path, policy, {'spec': spec, 'episodes': episodes_done})
             log(f'saved {path}')
-            if log_rollouts:
-                part = os.path.join(out_dir, f'rollouts_{logged_from}_{n_ep}.npz')
-                save_episodes(part, logged, meta={'spec': spec})
-                log(f"wrote {len(logged)} episodes ({np.mean([e['success'] for e in logged]):.2f} successful) to {part}")
-                logged, logged_from = [], n_ep
             if spec.get('eval'):
-                ev = spec['eval']
-                out = os.path.join(out_dir, f'eval_ep{n_ep}.json')
-                cmd = [sys.executable, '-m', 'ktask.evaluate', path, '-o', out, '--tasks', str(ev.get('tasks', 'all')),
-                       '--n', str(ev.get('n', 128))]
-                evals.append(subprocess.Popen(cmd, stdout=open(out + '.log', 'w'), stderr=subprocess.STDOUT))
+                evals.append(launch_eval(spec, path, out_dir, n_ep))
+        if episodes_done % resume_every == 0 and episodes_done < spec['episodes']:
+            torch.save({'policy': policy.state_dict(), 'critic': critic.state_dict(),
+                        'opt_actor': opt_actor.state_dict(), 'opt_critic': opt_critic.state_dict(),
+                        'gen': gen.get_state(), 'episodes_done': episodes_done, 'it': it}, resume + '.tmp')
+            os.replace(resume + '.tmp', resume)
     env.close()
     for p in evals:
         p.wait()
-    bad = [p.args for p in evals if p.returncode]
-    if bad:
-        log(f'{len(bad)} evaluations failed: {bad}')
-        sys.exit(1)
-    log('done')
+    log('training done')
+    if spec.get('eval'):        # missing evaluations: in a fresh process, with nothing of this one left
+        log_f.close()
+        sys.stdout.flush()
+        os.execv(sys.executable, [sys.executable, '-m', 'ktask.finish_evals', out_dir])
+
+
+def launch_eval(spec, path, out_dir, n_ep):
+    ev = spec['eval']
+    out = os.path.join(out_dir, f'eval_ep{n_ep}.json')
+    cmd = [sys.executable, '-m', 'ktask.evaluate', path, '-o', out, '--tasks', str(ev.get('tasks', 'all')),
+           '--n', str(ev.get('n', 128))]
+    return subprocess.Popen(cmd, stdout=open(out + '.log', 'w'), stderr=subprocess.STDOUT)
 
 
 if __name__ == '__main__':
