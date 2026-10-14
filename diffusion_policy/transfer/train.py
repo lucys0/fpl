@@ -6,10 +6,10 @@ two-peg transfer experiments. One JSON spec per run:
    "method": "bc" | "awr" | "udrl",          # SFT and filtered BC are both "bc"
    "udrl_mode": "scalar" | "axes",           # udrl only
    "data": [{"path": ..., "pegs": ["left"], "max_per_peg": null, "first_n": null,
-             "success_only": false, "rng_seed": 0, "replay": false}, ...],
+             "success_only": false, "fastest_frac": null, "rng_seed": 0, "replay": false}, ...],
    "replay_frac": 0.5,                       # share of training steps from "replay" data (repeated to reach it)
    "steps": 20000, "lr": 2e-4, "warmup": 500, "batch_size": 1024, "seed": 0,
-   "awr": {"gamma": 0.99, "beta": 1.0, "max_weight": 20.0},
+   "awr": {"gamma": 0.99, "beta": 1.0, "max_weight": 20.0, "time_cost": 0.0},   # gamma per env step
    "kl": {"target": 5.0, "mode": "hinge", "beta": 1e-3, "sub_batch": 128, "ref": init_ckpt,   # optional, below
           "states": [hdf5, ...]},                # where the KL is measured (default: the training batch)
    "wandb": {"project": ..., "group": ..., "name": ...}}
@@ -47,8 +47,10 @@ from transfer.common import (GOAL_DIM, MAX_STEPS, N_OBS_STEPS, EpisodeDataset, b
 
 def select_episodes(data_specs):
     """first_n is applied before success_only, so smaller budgets are prefixes of larger ones.
+    Specs with fastest_frac (successes only) are pooled, and that share of the pooled successes with
+    the shortest episodes is kept (successful rollouts end on success).
     Episodes from specs marked "replay" carry attrs['replay'] = True."""
-    episodes = []
+    episodes, ranked = [], []
     for spec in data_specs:
         eps = load_episodes(spec['path'], pegs=spec.get('pegs'), max_per_peg=spec.get('max_per_peg'),
                             rng_seed=spec.get('rng_seed', 0))
@@ -58,7 +60,16 @@ def select_episodes(data_specs):
             eps = [e for e in eps if e['attrs']['success']]
         for e in eps:
             e['attrs']['replay'] = bool(spec.get('replay', False))
-        episodes += eps
+        if spec.get('fastest_frac'):
+            assert spec.get('success_only'), 'fastest_frac ranks successful episodes'
+            ranked.append((spec['fastest_frac'], eps))
+        else:
+            episodes += eps
+    if ranked:
+        assert len({f for f, _ in ranked}) == 1, 'use one fastest_frac for all specs'
+        pool = [e for _, eps in ranked for e in eps]
+        keep = max(1, round(ranked[0][0] * len(pool)))
+        episodes += sorted(pool, key=lambda e: len(e['action']))[:keep]
     return episodes
 
 
@@ -77,18 +88,25 @@ def mix_replay(episodes, weights, frac, log):
 
 # ---------------------------------------------------------------- AWR
 
-def awr_weights(episodes, gamma, beta, max_weight, device, log):
+def awr_weights(episodes, gamma, beta, max_weight, device, log, time_cost=0.0):
     """Per-step weights exp(A / (beta * std A)), A = Monte-Carlo return - V(s).
 
     Reward is 1 on the step the nut lands on the commanded peg (recorded
-    successful rollouts end there) and 0 otherwise, discounted by gamma.
+    successful rollouts end there) and 0 otherwise, minus time_cost / MAX_STEPS
+    per step (PPO's time cost), discounted by gamma per step.
     """
     obs, ret = [], []
     for ep in episodes:
         T = len(ep['action'])
-        g = np.zeros(T, dtype=np.float32)
+        r = np.full(T, -time_cost / MAX_STEPS, dtype=np.float64)
         if ep['attrs']['success']:
-            g = gamma ** np.arange(T - 1, -1, -1, dtype=np.float32)
+            r[-1] += 1.0
+        g = np.zeros(T, dtype=np.float64)
+        acc = 0.0
+        for t in range(T - 1, -1, -1):
+            acc = r[t] + gamma * acc
+            g[t] = acc
+        g = g.astype(np.float32)
         obs.append(np.concatenate([ep['obs'][:T], np.broadcast_to(goal_vec(ep['attrs']['target_peg']), (T, GOAL_DIM))], -1))
         ret.append(g)
     X = torch.from_numpy(np.concatenate(obs)).to(device)
@@ -180,7 +198,8 @@ def main(spec_path):
     if method == 'awr':
         a = spec.get('awr', {})
         rollouts = [e for e in episodes if not e['attrs']['replay']]
-        w = iter(awr_weights(rollouts, a.get('gamma', 0.99), a.get('beta', 1.0), a.get('max_weight', 20.0), device, log))
+        w = iter(awr_weights(rollouts, a.get('gamma', 0.99), a.get('beta', 1.0), a.get('max_weight', 20.0), device, log,
+                             a.get('time_cost', 0.0)))
         weights = [np.ones(len(e['action']), dtype=np.float32) if e['attrs']['replay'] else next(w) for e in episodes]
     episodes, weights = mix_replay(episodes, weights, spec.get('replay_frac', 0.5), log)
 

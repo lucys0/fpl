@@ -16,6 +16,7 @@ shared between the two tasks; transport and insertion are not.
 """
 
 import json
+import math
 import os
 
 import click
@@ -49,10 +50,13 @@ PPO_SPEC = {'sigma': 0.02, 'noise_steps': [0, 10], 'lr': 1e-6, 'critic_lr': 1e-3
 
 
 class Job:
-    def __init__(self, name, after=()):
+    def __init__(self, name, after=(), kind='gpu', cpus=None):
+        """kind 'cpu': evaluation only, run without a GPU (transfer.submit bundles these); cpus: per-job
+        CPU request (default: transfer.submit's)."""
         self.dir = f'{RUNS}/{name}'
         self.name = name.replace('/', '-')
         self.after = list(after)
+        self.kind, self.cpus = kind, cpus
         self.lines = []
         os.makedirs(self.dir, exist_ok=True)
 
@@ -75,7 +79,8 @@ class Job:
     def write(self):
         with open(f'{self.dir}/steps.sh', 'w') as f:
             f.write('#!/bin/bash\nset -eo pipefail\n' + '\n'.join(self.lines) + f'\ntouch {self.dir}/DONE\n')
-        return {'name': self.name, 'dir': self.dir, 'after': self.after}
+        out = {'name': self.name, 'dir': self.dir, 'after': self.after, 'kind': self.kind}
+        return {**out, 'cpus': self.cpus} if self.cpus else out
 
 
 def write_manifest(stage, jobs):
@@ -674,6 +679,231 @@ def x5(seeds, methods):
                 job.rollout(f'step{st}_eval', ckpt, X_PEGS, EVAL_N, EVAL_SEED, nut_range=None)
             jobs.append(job.write())
     write_manifest(f"x5_s{seeds.replace(',', '')}", jobs)
+
+
+# ======================================================================================
+# Third round (2026-10-13)
+#  a*: bases that never see B (BC on A only; then PPO, or more supervised learning, on A). B is then
+#      learned from clean demos (SFT on k of them) or by PPO, to compare how fast each start learns it.
+#  xlearn, xppob: how fast the round-nut task is learned from the second pair's checkpoints
+#  mlog, xlog: PPO with its training episodes logged; filtered BC / AWR trained on exactly those episodes
+#  mtime, xtime: PPO with a time cost (pays for speed), logged; offline speed learners on its episodes
+#  probes, xpeg: evaluation only: perturbations on both pairs, and the round peg moved
+# Evaluations are separate CPU-only jobs (kind 'cpu'): they are bound by simulation, not the GPU.
+# ======================================================================================
+CLEAN_ROUND = f'{DATA}/ceil_round.hdf5'      # clean scripted round-nut demos (ring grasp), successes only
+CLEAN = {'right': CLEAN_B, 'round': CLEAN_ROUND}
+A_ALL_PEGS = 'left,right,round'
+TIME_COST = 2.0                               # a full-length (500-step) episode costs 2; success pays 1
+PPO_GAMMA_STEP = PPO_SPEC['gamma'] ** (1 / 8)      # PPO discounts per 8-step decision
+LR_PATH = (1e-6, 10000, 1000, (1000, 3000, 6000, 10000))   # lr, steps, save every, evaluated steps (m5's 1e-06)
+A_KS = (5, 10, 25, 50, 100)                   # clean B demos, for starts that never saw B
+LOG_BUDGETS = (1000, 3000, 6000)
+PPO_CPUS = 32
+
+
+def eval_job(name, ckpt, pegs, after=(), extra=''):
+    """CPU-only evaluation of one checkpoint on the evaluation start states -> runs/<name>/eval.json."""
+    job = Job(name, after=after, kind='cpu')
+    out = f'{job.dir}/eval.json'
+    job.lines.append(f'[ -f {out} ] || python -m transfer.rollout --ckpt {ckpt} --pegs {pegs} --n {EVAL_N} '
+                     f'--seed_start {EVAL_SEED} --env_meta_from {ENV_META} --out_json {out}'
+                     + (f' {extra}' if extra else ''))
+    return job.write()
+
+
+def ppo_stage(name, init_ckpt, peg, seed, budgets, eval_pegs, after=(), **overrides):
+    """A PPO job (training only) and a CPU evaluation job per saved checkpoint, run after it.
+    Returns (manifest entries, PPO job name, PPO output dir)."""
+    job = Job(name, after=after, cpus=PPO_CPUS)
+    out = f'{job.dir}/ppo'
+    spec = {**PPO_SPEC, **overrides, 'init_ckpt': init_ckpt, 'peg': peg, 'seed': seed, 'episodes': max(budgets),
+            'save_at': list(budgets), 'env_meta_from': ENV_META, 'nut_range': None, 'out_dir': out}
+    json.dump(spec, open(f'{job.dir}/ppo.json', 'w'), indent=1)
+    job.lines.append(f'[ -f {out}/ppo_ep{max(budgets)}.ckpt ] || python -m transfer.ppo {job.dir}/ppo.json')
+    jobs = [job.write()]
+    jobs += [eval_job(f'{name}/eval_n{n}', f'{out}/ppo_ep{n}.ckpt', eval_pegs, after=[job.name]) for n in budgets]
+    return jobs, job.name, out
+
+
+def train_eval(name, spec, eval_pegs, after=(), path=False):
+    """One supervised run (8 CPUs), then CPU evaluations: of the final checkpoint, or along LR_PATH."""
+    job = Job(name, after=after, cpus=8)
+    if not path:
+        final = job.train('train', spec)
+        return [job.write(), eval_job(f'{name}/eval', final, eval_pegs, after=[job.name])]
+    lr, steps, every, evals = LR_PATH
+    final = job.train('train', {**spec, 'steps': steps, 'lr': lr, 'warmup': 200, 'batch_size': 1024, 'save_every': every})
+    jobs = [job.write()]
+    for st in evals:
+        ckpt = final if st == steps else final.replace('final.ckpt', f'step{st}.ckpt')
+        jobs.append(eval_job(f'{name}/eval_step{st}', ckpt, eval_pegs, after=[job.name]))
+    return jobs
+
+
+def learn_b_spec(ckpt, seed, task, k):
+    """SFT on the first k clean demos of B (LEARN_B_STEPS steps, lr 1e-4), as add_learn_b."""
+    return {'method': 'bc', 'init_ckpt': ckpt, 'seed': seed, 'steps': LEARN_B_STEPS, 'lr': 1e-4, 'warmup': 100,
+            'batch_size': 1024, 'data': [{'path': CLEAN[task], 'first_n': k}]}
+
+
+def a_base_ckpt(s):
+    return f'{RUNS}/a0/base_s{s}/train/final.ckpt'
+
+
+def a_starts(s):
+    return {'base': a_base_ckpt(s), 'ppoA6000': f'{RUNS}/a1/s{s}/ppo/ppo/ppo_ep6000.ckpt',
+            'sft_expert': f'{RUNS}/a1/s{s}/sft_expert/train/final.ckpt',
+            'filtered_bc': f'{RUNS}/a1/s{s}/filtered_bc/train/final.ckpt'}
+
+
+@cli.command()
+@click.option('--seeds', default='0,1,2')
+@click.option('--ks', default=','.join(map(str, A_KS)))
+def a(seeds, ks):
+    """B never in pretraining. a0: BC on task A's mixed-quality pretraining episodes only (m0's A half),
+    evaluated on A and, zero-shot, on both B tasks (whose goal input it never saw). a1: post-training on A
+    by PPO (episodes logged), SFT on 1000 clean A demos, or filtered BC on the 1000-episode A pool (the usual
+    recipe). a2: SFT on k clean B demos from each of these, for B = the right peg and B = the round nut."""
+    jobs = []
+    for s in map(int, seeds.split(',')):
+        base_jobs = train_eval(f'a0/base_s{s}', {'method': 'bc', 'seed': s, 'steps': BASE_STEPS, 'lr': 2e-4,
+                                                 'warmup': 500, 'batch_size': 1024,
+                                                 'data': [{'path': MIXED_PRETRAIN[0]}]}, A_ALL_PEGS)
+        jobs += base_jobs
+        after = {'base': base_jobs[0]['name']}
+        ppo, after['ppoA6000'], _ = ppo_stage(f'a1/s{s}/ppo', a_base_ckpt(s), 'left', s, LOG_BUDGETS, A_ALL_PEGS,
+                                              after=[after['base']], log_rollouts=True)
+        jobs += ppo
+        common = {'init_ckpt': a_base_ckpt(s), 'seed': s, 'steps': POST_STEPS, 'lr': 1e-4, 'warmup': 200,
+                  'batch_size': 1024}
+        for m in ('sft_expert', 'filtered_bc'):
+            arm = train_eval(f'a1/s{s}/{m}', m_method_spec(m, 1000, common), A_ALL_PEGS, after=[after['base']])
+            jobs += arm
+            after[m] = arm[0]['name']
+        for start, ckpt in a_starts(s).items():
+            for task in ('right', 'round'):
+                job = Job(f'a2/s{s}/{start}/{task}', after=[after[start]], cpus=8)
+                ckpts = {k: job.train(f'k{k}', learn_b_spec(ckpt, s, task, k)) for k in map(int, ks.split(','))}
+                jobs.append(job.write())
+                jobs += [eval_job(f'a2/s{s}/{start}/{task}/eval_k{k}', c, task, after=[job.name]) for k, c in ckpts.items()]
+    write_manifest(f"a_s{seeds.replace(',', '')}", jobs)
+
+
+def x_starts(s):
+    return {'base': x_base_ckpt(s), 'ppoA6000': f'{RUNS}/x2/s{s}/ppo/ppo/ppo_ep6000.ckpt',
+            'sft_expert_r1000': f'{RUNS}/x1r/s{s}/sft_expert/n1000/final.ckpt',
+            'filtered_bc_r1000': f'{RUNS}/x1r/s{s}/filtered_bc/n1000/final.ckpt',
+            'sft_expert_lr1e6_400': f'{RUNS}/x5/s{s}/sft_expert_lr1e-06early/train/step400.ckpt'}
+
+
+def m_starts(s):
+    return {'base': m_base_ckpt(s), 'ppoA6000': f'{RUNS}/m2/s{s}/ppo/ppo/ppo_ep6000.ckpt',
+            'sft_expert_r1000': f'{RUNS}/m1r/s{s}/sft_expert/n1000/final.ckpt',
+            'filtered_bc_r1000': f'{RUNS}/m1r/s{s}/filtered_bc/n1000/final.ckpt',
+            'sft_expert_lr1e6_700': f'{RUNS}/m5/s{s}/sft_expert_lr1e-06early/train/step700.ckpt'}
+
+
+@cli.command()
+@click.option('--seeds', default='0,1,2')
+@click.option('--ks', default='3,5,10')
+def xlearn(seeds, ks):
+    """How fast the round-nut task is learned (SFT on k clean round-nut demos) from the second pair's
+    checkpoints."""
+    jobs = []
+    for s in map(int, seeds.split(',')):
+        for start, ckpt in x_starts(s).items():
+            job = Job(f'xlearn/s{s}/{start}', cpus=8)
+            ckpts = {k: job.train(f'k{k}', learn_b_spec(ckpt, s, 'round', k)) for k in map(int, ks.split(','))}
+            jobs.append(job.write())
+            jobs += [eval_job(f'xlearn/s{s}/{start}/eval_k{k}', c, 'round', after=[job.name]) for k, c in ckpts.items()]
+    write_manifest(f"xlearn_s{seeds.replace(',', '')}", jobs)
+
+
+@cli.command()
+@click.option('--seeds', default='0,1,2')
+@click.option('--starts', default='base,ppoA6000,sft_expert_r1000')
+def xppob(seeds, starts):
+    """PPO on the round-nut task from the second pair's checkpoints: does RL on A speed up RL on B?"""
+    jobs = []
+    for s in map(int, seeds.split(',')):
+        pool = x_starts(s)
+        for start in starts.split(','):
+            jobs += ppo_stage(f'xppob/s{s}/{start}', pool[start], 'round', s, B_PPO_BUDGETS, X_PEGS)[0]
+    write_manifest(f"xppob_s{seeds.replace(',', '')}", jobs)
+
+
+@cli.command()
+@click.option('--pair', type=click.Choice(['m', 'x']), required=True)
+@click.option('--seeds', default='0,1,2')
+@click.option('--time_cost', default=0.0, help=f'0: PPO\'s usual reward (stage <pair>log); e.g. {TIME_COST}: <pair>time')
+def logged(pair, seeds, time_cost):
+    """PPO on A with its training episodes logged, then offline learners trained on exactly those episodes
+    along LR_PATH (lr 1e-6), from the same base. Usual reward: filtered BC (successes) and AWR (PPO's reward
+    and discount). With a time cost: filtered BC on the fastest 30% of successes, and AWR with the time cost."""
+    stage = f"{pair}{'time' if time_cost else 'log'}"
+    base_fn, pegs = (m_base_ckpt, 'left,right') if pair == 'm' else (x_base_ckpt, X_PEGS)
+    jobs = []
+    for s in map(int, seeds.split(',')):
+        overrides = {'log_rollouts': True, **({'time_cost': time_cost} if time_cost else {})}
+        ppo, ppo_name, out = ppo_stage(f'{stage}/s{s}/ppo', base_fn(s), 'left', s, LOG_BUDGETS, pegs, **overrides)
+        jobs += ppo
+        parts, prev = [], 0
+        for n in LOG_BUDGETS:
+            parts.append({'path': f'{out}/rollouts_{prev}_{n}.hdf5'})
+            prev = n
+        if time_cost:
+            arms = {'fast_bc': {'method': 'bc', 'data': [{**p, 'success_only': True, 'fastest_frac': 0.3} for p in parts]},
+                    'awr_time': {'method': 'awr', 'awr': {'gamma': PPO_GAMMA_STEP, 'time_cost': time_cost}, 'data': parts}}
+        else:
+            arms = {'filtered_bc': {'method': 'bc', 'data': [{**p, 'success_only': True} for p in parts]},
+                    'awr': {'method': 'awr', 'awr': {'gamma': PPO_GAMMA_STEP}, 'data': parts}}
+        for arm, spec in arms.items():
+            jobs += train_eval(f'{stage}/s{s}/{arm}', {**spec, 'init_ckpt': base_fn(s), 'seed': s}, pegs,
+                               after=[ppo_name], path=True)
+    write_manifest(f"{stage}_s{seeds.replace(',', '')}", jobs)
+
+
+PROBES_V2 = {'push4_50': '--push_step 50 --push_dist 0.04',       # nut moved 4 cm early in the approach
+             'push4_120': '--push_step 120 --push_dist 0.04',     # ... around grasp time
+             'friction0.1': '--friction_scale 0.1'}               # slippery nut
+
+
+@cli.command()
+@click.option('--seeds', default='0,1,2')
+def probes(seeds):
+    """Robustness probes (evaluation only) on both tasks of both pairs, for the base and the post-trained arms."""
+    jobs = []
+    for pair, starts_fn, pegs in (('m', m_starts, 'left,right'), ('x', x_starts, X_PEGS)):
+        for s in map(int, seeds.split(',')):
+            for arm, ckpt in starts_fn(s).items():
+                for probe, opts in PROBES_V2.items():
+                    jobs.append(eval_job(f'{pair}probe/s{s}/{arm}/{probe}', ckpt, pegs, extra=opts))
+    write_manifest(f"probes_s{seeds.replace(',', '')}", jobs)
+
+
+# Round-nut release, median offset from the round peg (runs/xrec): base (+1.02, -0.26) cm, PPO on A (+1.34, -0.54)
+PEG_SHIFT_DIR = (0.32, -0.28)
+PEG_SHIFTS_CM = (-0.425, 0.425, 0.85, 1.275, 1.7)       # along PEG_SHIFT_DIR; 0.425 cm = the base-to-PPO shift
+
+
+@cli.command()
+@click.option('--seeds', default='0,1,2')
+@click.option('--arms', default='base,ppoA6000,sft_expert_r1000')
+def xpeg(seeds, arms):
+    """The round peg moved along PPO's release shift (evaluation only, round-nut task): if PPO's loss on B is
+    its shifted release, its success curve over peg positions is the base's shifted by 0.425 cm."""
+    norm = math.hypot(*PEG_SHIFT_DIR)
+    u = (PEG_SHIFT_DIR[0] / norm, PEG_SHIFT_DIR[1] / norm)
+    jobs = []
+    for s in map(int, seeds.split(',')):
+        pool = x_starts(s)
+        for arm in arms.split(','):
+            for t in PEG_SHIFTS_CM:
+                dx, dy = t / 100 * u[0], t / 100 * u[1]
+                jobs.append(eval_job(f'xpeg/s{s}/{arm}/t{t:+.3f}', pool[arm], 'round',
+                                     extra=f'--peg2_shift {dx:.5f},{dy:.5f}'))
+    write_manifest(f"xpeg_s{seeds.replace(',', '')}", jobs)
 
 
 @cli.command()

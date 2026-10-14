@@ -61,8 +61,9 @@ def summarize(episodes):
 @click.option('--push_step', default=None, type=int, help='Robustness probe: env step at which the nut is moved')
 @click.option('--push_dist', default=0.04, type=float)
 @click.option('--friction_scale', default=1.0, type=float, help='Robustness probe: scale the nut\'s friction')
+@click.option('--peg2_shift', default=None, help='Probe: move the right (round) peg by "dx,dy" meters')
 def main(ckpt, pegs, n, seed_start, n_envs, env_meta_path, out_json, record, cond, nut_range, no_ema, sigma, noise_steps,
-         push_step, push_dist, friction_scale):
+         push_step, push_dist, friction_scale, peg2_shift):
     t0 = time.time()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     policy, ema_policy, payload = load_checkpoint(ckpt, device)
@@ -71,6 +72,7 @@ def main(ckpt, pegs, n, seed_start, n_envs, env_meta_path, out_json, record, con
     extra = json.loads(cond) if cond else payload['info'].get('eval_cond', [])
     assert len(extra) == payload['extra_cond_dim'], (extra, payload['extra_cond_dim'])
     nut_range = json.loads(nut_range) if nut_range else None
+    peg2_shift = [float(x) for x in peg2_shift.split(',')] if peg2_shift else None
     actor = None
     if sigma > 0:
         from transfer.ppo import Actor
@@ -86,7 +88,7 @@ def main(ckpt, pegs, n, seed_start, n_envs, env_meta_path, out_json, record, con
         nut = 'round' if peg == 'round' else 'square'
         if nut not in envs:
             envs[nut] = AsyncVectorEnv([make_env_fn(env_meta, nut_range=nut_range, push_step=push_step, push_dist=push_dist,
-                                                    friction_scale=friction_scale, nut=nut)] * n_envs)
+                                                    friction_scale=friction_scale, nut=nut, peg2_shift=peg2_shift)] * n_envs)
         return envs[nut]
 
     results, recorded = {}, []
@@ -139,6 +141,7 @@ def main(ckpt, pegs, n, seed_start, n_envs, env_meta_path, out_json, record, con
         json.dump({'ckpt': ckpt, 'cond': extra, 'nut_range': nut_range, 'seed_start': seed_start,
                    'ema': not no_ema, 'sigma': sigma, 'noise_steps': noise_steps, 'push_step': push_step,
                    'push_dist': push_dist if push_step is not None else None, 'friction_scale': friction_scale,
+                   'peg2_shift': peg2_shift,
                    'results': results}, f, indent=1)
     if record:
         write_episodes(record, recorded, env_meta)

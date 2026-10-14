@@ -7,8 +7,9 @@ Gaussian transitions with tractable log-probabilities (as DPPO, Ren et al.
 2024, does for diffusion policies). Every chain step of a decision shares that
 decision's advantage; log-probabilities cover the executed part of the action
 chunk. Reward is 1 when the nut lands on the commanded peg, which ends the
-episode; landing on the other peg ends it with 0. Dropout stays off so rollout
-and update log-probabilities agree.
+episode; landing on the other peg ends it with 0. Optional "time_cost" c subtracts
+c * (steps / MAX_STEPS) over an episode (a full-length episode costs c), so faster success pays more.
+Dropout stays off so rollout and update log-probabilities agree.
 
 Usage: python -m transfer.ppo spec.json
   {"out_dir": ..., "init_ckpt": ..., "peg": "left", "episodes": 1000, "save_at": [200, 1000],
@@ -16,7 +17,9 @@ Usage: python -m transfer.ppo spec.json
    "minibatch": 256, "clip": 0.1, "gamma": 0.99, "lam": 0.95, "target_kl": 0.05, "seed": 0,
    "env_meta_from": <hdf5 with env_args>, "nut_range": [[xlo, ylo], [xhi, yhi]] or null}
 Checkpoints at each `save_at` episode count (ppo_ep<N>.ckpt) use the same format
-as transfer.train, so transfer.rollout evaluates them (deterministically).
+as transfer.train, so transfer.rollout evaluates them (deterministically). With "log_rollouts": true,
+every training episode is also written, in the recorded-rollout format (rollouts_<M>_<N>.hdf5 holds
+episodes M+1..N, one file per save point), so offline methods can train on exactly PPO's data.
 """
 
 import json
@@ -32,9 +35,10 @@ import torch.nn as nn
 from diffusion_policy.gym_util.async_vector_env import AsyncVectorEnv
 
 from transfer.common import (ACTION_DIM, HORIZON, MAX_STEPS, N_ACTION_STEPS, N_OBS_STEPS, env_meta_from,
-                             goal_vec, load_checkpoint, make_env_fn, save_checkpoint, to_env_action)
+                             goal_vec, load_checkpoint, make_env_fn, save_checkpoint, to_env_action, write_episodes)
 
 PEG_ID = {'left': 1, 'right': 2, 'round': 2}         # round: the round nut onto the right peg
+PEG_NAMES = {0: 'none', 1: 'left', 2: 'right'}
 A0, A1 = N_OBS_STEPS - 1, N_OBS_STEPS - 1 + N_ACTION_STEPS      # executed slice of the action chunk
 
 
@@ -109,8 +113,11 @@ def main(spec_path):
     opt_critic = torch.optim.Adam(critic.parameters(), lr=spec.get('critic_lr', 1e-3))
 
     n_envs = spec.get('n_envs', 30)
-    env = AsyncVectorEnv([make_env_fn(env_meta_from(spec['env_meta_from']), nut_range=spec.get('nut_range'),
+    env_meta = env_meta_from(spec['env_meta_from'])
+    env = AsyncVectorEnv([make_env_fn(env_meta, nut_range=spec.get('nut_range'),
                                       nut='round' if peg == 'round' else 'square')] * n_envs)
+    step_cost = spec.get('time_cost', 0.0) * N_ACTION_STEPS / MAX_STEPS      # per decision while the episode runs
+    log_rollouts, logged, logged_from = spec.get('log_rollouts', False), [], 0
     gamma, lam, clip = spec.get('gamma', 0.99), spec.get('lam', 0.95), spec.get('clip', 0.1)
     save_at = sorted(spec.get('save_at', [spec['episodes']]))
     episodes_done, it, t0 = 0, 0, time.time()
@@ -118,7 +125,8 @@ def main(spec_path):
 
     while episodes_done < spec['episodes']:
         # ---------------- collect one batch of episodes
-        env.seed([5_000_000 + 100_000 * seed + episodes_done + i for i in range(n_envs)])
+        env_seeds = [5_000_000 + 100_000 * seed + episodes_done + i for i in range(n_envs)]
+        env.seed(env_seeds)
         obs = env.reset()
         alive = np.ones(n_envs, dtype=bool)
         buf = {k: [] for k in ('cond', 'xs', 'logp', 'value', 'reward', 'alive')}
@@ -140,12 +148,25 @@ def main(spec_path):
                     ended[i] = True
                     if p == PEG_ID[peg]:
                         reward[i], success[i] = 1.0, True
+            reward -= step_cost * alive
             for k, v in zip(buf, (cond, xs, logp, value, torch.from_numpy(reward).to(device),
                                   torch.from_numpy(alive.copy()).to(device))):
                 buf[k].append(v)
             alive &= ~ended & ~np.asarray(done, dtype=bool)
             if not alive.any():
                 break
+        if log_rollouts:            # as transfer.rollout records them: each episode ends on its first peg contact
+            for i, traj in enumerate(env.call('get_trajectory')):
+                pegs_t = np.asarray(traj['peg'])
+                on = np.nonzero(pegs_t)[0]
+                first_step = int(on[0]) if len(on) else -1
+                T = first_step + 1 if len(on) else min(len(traj['action7']), MAX_STEPS)
+                final_peg = PEG_NAMES[int(pegs_t[first_step])] if len(on) else 'none'
+                ok = bool(len(on)) and int(pegs_t[first_step]) == PEG_ID[peg]
+                logged.append({'obs': np.asarray(traj['obs'][:T], dtype=np.float32),
+                               'action7': np.asarray(traj['action7'][:T], dtype=np.float32),
+                               'attrs': {'target_peg': peg, 'seed': env_seeds[i], 'success': ok, 'final_peg': final_peg,
+                                         'first_success_step': first_step if ok else -1, 'ppo_iter': it + 1}})
         episodes_done += n_envs
         it += 1
 
@@ -204,6 +225,12 @@ def main(spec_path):
             path = os.path.join(out_dir, f'ppo_ep{save_at[0]}.ckpt')
             save_checkpoint(path, policy, policy, 0, {'spec': spec, 'episodes': episodes_done})
             log(f"saved {path}")
+            if log_rollouts:
+                part = os.path.join(out_dir, f'rollouts_{logged_from}_{save_at[0]}.hdf5')
+                write_episodes(part + '.tmp', logged, env_meta)
+                os.replace(part + '.tmp', part)
+                log(f"wrote {len(logged)} episodes ({np.mean([e['attrs']['success'] for e in logged]):.2f} successful) to {part}")
+                logged, logged_from = [], save_at[0]
             save_at.pop(0)
     env.close()
 

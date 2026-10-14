@@ -245,13 +245,17 @@ class RecordingWrapper(gym.Wrapper):
 
 class ProbeWrapper(gym.Wrapper):
     """Physical perturbations for robustness probes: the nut's friction scaled by
-    `friction_scale`, and at env step `push_step` the nut moved `push_dist` meters in a
-    random horizontal direction (drawn from np.random, which the env seed sets)."""
+    `friction_scale`, at env step `push_step` the nut moved `push_dist` meters in a
+    random horizontal direction (drawn from np.random, which the env seed sets), and the
+    right (round) peg moved by `peg2_shift` = (dx, dy) meters. The policy observes neither peg,
+    so a moved peg changes only where the nut has to go, not what the policy sees."""
 
-    def __init__(self, env, push_step=None, push_dist=0.0, friction_scale=1.0):
+    def __init__(self, env, push_step=None, push_dist=0.0, friction_scale=1.0, peg2_shift=None):
         super().__init__(env)
         self.push_step, self.push_dist, self.friction_scale = push_step, push_dist, friction_scale
-        self._friction0 = None
+        self.peg2_shift = None if peg2_shift is None else np.asarray(peg2_shift, dtype=np.float64)
+        self.nut = getattr(env.unwrapped, 'nut_name', 'SquareNut')
+        self._friction0, self._peg2_pos0 = None, None
 
     def _robosuite(self):
         return self.unwrapped.env.env
@@ -259,13 +263,19 @@ class ProbeWrapper(gym.Wrapper):
     def reset(self, **kwargs):
         obs = self.env.reset(**kwargs)
         self.t = 0
+        rs = self._robosuite()
+        m = rs.sim.model
         if self.friction_scale != 1.0:
-            rs = self._robosuite()
-            m = rs.sim.model
-            geoms = [i for i in range(m.ngeom) if m.geom_bodyid[i] == rs.obj_body_id['SquareNut']]
+            geoms = [i for i in range(m.ngeom) if m.geom_bodyid[i] == rs.obj_body_id[self.nut]]
             if self._friction0 is None:
                 self._friction0 = m.geom_friction[geoms].copy()
             m.geom_friction[geoms] = self._friction0 * self.friction_scale
+        if self.peg2_shift is not None:
+            # a hard reset reloads the model, so set the position from the original every time
+            if self._peg2_pos0 is None:
+                self._peg2_pos0 = m.body_pos[rs.peg2_body_id].copy()
+            m.body_pos[rs.peg2_body_id, :2] = self._peg2_pos0[:2] + self.peg2_shift
+            rs.sim.forward()
         return obs
 
     def step(self, action):
@@ -273,7 +283,7 @@ class ProbeWrapper(gym.Wrapper):
         self.t += 1
         if self.push_step is not None and self.t == self.push_step:
             sim = self._robosuite().sim
-            start, _ = sim.model.get_joint_qpos_addr('SquareNut_joint0')
+            start, _ = sim.model.get_joint_qpos_addr(f'{self.nut}_joint0')
             angle = np.random.uniform(0, 2 * np.pi)
             sim.data.qpos[start:start + 2] += self.push_dist * np.array([np.cos(angle), np.sin(angle)])
             sim.forward()
@@ -282,7 +292,7 @@ class ProbeWrapper(gym.Wrapper):
 
 
 def make_env_fn(env_meta, max_steps=MAX_STEPS, nut_range=None, push_step=None, push_dist=0.0, friction_scale=1.0,
-                nut='square'):
+                nut='square', peg2_shift=None):
     """Two-peg env, recorded, with diffusion policy's multi-step execution; nut 'round' for the round-nut task."""
     def env_fn():
         from diffusion_policy.env.robomimic.robomimic_twopeg_lowdim_wrapper import RobomimicTwoPegLowdimWrapper
@@ -290,7 +300,7 @@ def make_env_fn(env_meta, max_steps=MAX_STEPS, nut_range=None, push_step=None, p
         from diffusion_policy.gym_util.multistep_wrapper import MultiStepWrapper
         if nut == 'round':
             from transfer.round_task import RoundNutTwoPegWrapper, round_env_meta
-            assert nut_range is None and push_step is None and friction_scale == 1.0, 'probes are square-nut only'
+            assert nut_range is None, 'the start range override is square-nut only'
             twopeg = RoundNutTwoPegWrapper(env=create_env(env_meta=round_env_meta(env_meta), obs_keys=OBS_KEYS),
                                            obs_keys=OBS_KEYS, init_state=None)
         else:
@@ -306,8 +316,9 @@ def make_env_fn(env_meta, max_steps=MAX_STEPS, nut_range=None, push_step=None, p
                 return state
             twopeg._make_init_state = make_init_state
         env = twopeg
-        if push_step is not None or friction_scale != 1.0:
-            env = ProbeWrapper(twopeg, push_step=push_step, push_dist=push_dist, friction_scale=friction_scale)
+        if push_step is not None or friction_scale != 1.0 or peg2_shift is not None:
+            env = ProbeWrapper(twopeg, push_step=push_step, push_dist=push_dist, friction_scale=friction_scale,
+                               peg2_shift=peg2_shift)
         return MultiStepWrapper(RecordingWrapper(env), n_obs_steps=N_OBS_STEPS,
                                 n_action_steps=N_ACTION_STEPS, max_episode_steps=max_steps)
     return env_fn
