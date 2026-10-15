@@ -15,6 +15,9 @@ import numpy as np
 from ktask.data import SPLITS
 from ktask.jobs import ROOT, Job, write_manifest
 
+# 'v2': runs after the observation-history fix (2026-10-14 evening); v1 results (rollouts with observations
+# 8 steps apart) stay in the unsuffixed directories
+V = 'v2'
 DATA = f'{ROOT}/data'
 MIXED, EXPERT = f'{DATA}/mixed.npz', f'{DATA}/expert.npz'
 RUNS = f'{ROOT}/runs'
@@ -118,8 +121,8 @@ LR_PATH = (10000, [1000, 3000, 6000, 10000])   # offline arms: steps, evaluated 
 def e1_dir(s, c, k):
     """K = 16 trains on all of R in every chain; its replicates are PPO seeds (c = 0, 1)."""
     if k == 16:
-        return f'{RUNS}/e1/s{s}/k16' if not c else f'{RUNS}/e1/s{s}/k16_p{c}'
-    return f'{RUNS}/e1/s{s}/c{c}/k{k}'
+        return f'{RUNS}/e1{V}/s{s}/k16' if not c else f'{RUNS}/e1{V}/s{s}/k16_p{c}'
+    return f'{RUNS}/e1{V}/s{s}/c{c}/k{k}'
 
 
 @cli.command()
@@ -145,8 +148,8 @@ def e1(seeds, chains, episodes, lr, per_job):
                 d = e1_dir(s, c, k)
                 runs.append((d, ppo_run(d, base_ckpt(s), chain(s, c)[:k], s, episodes, save_at, lr=lr,
                                         log_rollouts=k in LOG_KS and c < 2)))
-            jobs += pack(f'e1/s{s}/c{c}', runs, per_job, after=[f'base-s{s}'], time='05:00:00')
-    write_manifest('e1', jobs)
+            jobs += pack(f'e1{V}/s{s}/c{c}', runs, per_job, after=[f'base-s{s}'], time='03:00:00')
+    write_manifest(f'e1{V}', jobs)
 
 
 def job_of(run_dir):
@@ -287,6 +290,134 @@ def pilot3(seed, episodes):
         runs.append((d, ppo_run(d, base, chain(seed, 0)[:k], seed, episodes, save_at, minibatch=256, **over)))
     jobs = pack(f'pilot3/s{seed}', runs, per_job=3, after=[f'base-s{seed}'])
     write_manifest(f'pilot3_s{seed}', jobs)
+
+
+# ------------------------------------------------------------------ follow-ups (2026-10-14 evening)
+
+E2X_RUNS = ((0, 0), (1, 1), (2, 1))       # (seed, chain) of logged K = 1 runs: tall-air, puck-platform, bar-air
+
+
+@cli.command()
+@click.option('--episodes', default=32768)
+@click.option('--n', default=16384, help='episodes to record per dataset')
+def e2x(episodes, n):
+    """Why filtered BC on PPO's episodes fails. For three K = 1 runs, BC (the E2 recipe, from the base) on:
+    the final PPO policy's own episodes without chain noise (det) and with it (sigma), the base's own
+    episodes (self), and PPO's logged episodes or clean expert demos with half of each batch replayed from
+    the pretraining pool (replay)."""
+    jobs = []
+    for s, c in E2X_RUNS:
+        src = e1_dir(s, c, 1)
+        task = chain(s, c)[0]
+        base = f'{RUNS}/e2x/s{s}/c{c}'
+        col = Job(f'e2x/s{s}/c{c}/collect', after=[job_of(src)], time='02:00:00')
+        data = {'det': f'{col.dir}/ppo_det.npz', 'sigma': f'{col.dir}/ppo_sigma.npz', 'self': f'{col.dir}/base_det.npz'}
+        col.lines.append(f'python -m ktask.collect {src}/ppo_ep{episodes}.ckpt -o {data["det"]} --tasks {task} --n {n}')
+        col.lines.append(f'python -m ktask.collect {src}/ppo_ep{episodes}.ckpt -o {data["sigma"]} --tasks {task} --n {n} '
+                         f'--sigma 0.02')
+        col.lines.append(f'python -m ktask.collect {base_ckpt(s)} -o {data["self"]} --tasks {task} --n {n}')
+        jobs.append(col.write())
+        common = {'init_ckpt': base_ckpt(s), 'seed': s, 'lr': 1e-6, 'method': 'bc'}
+        replay = {'path': MIXED, 'tasks': 'RH', 'replay': True}
+        arms = {f'fbc_{k}': [{'path': p, 'success_only': True}] for k, p in data.items()}
+        arms['fbc_logged_replay'] = [{'glob': f'{src}/rollouts_*.npz', 'max_end': episodes, 'success_only': True}, replay]
+        arms['sft_expert_replay'] = [{'path': EXPERT, 'tasks': [int(task)]}, replay]
+        for name, d in arms.items():
+            after = [col.name] if name.startswith('fbc_') and 'logged' not in name else [job_of(src)]
+            jobs.append(offline_job(f'e2x/s{s}/c{c}/{name}', {**common, 'data': d}, after=after))
+    write_manifest('e2x', jobs)
+
+
+@cli.command()
+@click.option('--episodes', default=32768)
+def e3x(episodes):
+    """Learnability curves on the never-seen tasks U: SFT on k in {1, 5} clean demos per U task at a gentle
+    lr (2e-5), evaluated on U and H after 250, 1000 and 4000 steps, from the base, PPO on 1, 4 and 16 tasks
+    (chain 0), and SFT on clean expert demos of the 16 R tasks (the supervised counterpart of PPO on 16)."""
+    jobs = []
+    for s in (0, 1, 2):
+        starts = {'base': (base_ckpt(s), f'base-s{s}'),
+                  'sft_expert_k16': (f'{RUNS}/e2/s{s}/k16/sft_expert/final.ckpt', f'e2-s{s}-k16-sft_expert')}
+        for k in (1, 4, 16):
+            d = e1_dir(s, 0, k)
+            starts[f'ppo_k{k}'] = (f'{d}/ppo_ep{episodes}.ckpt', job_of(d))
+        for name, (ckpt, dep) in starts.items():
+            job = Job(f'e3x/s{s}/{name}', after=[dep], time='02:00:00')
+            for kd in (1, 5):
+                out = f'{job.dir}/k{kd}'
+                os.makedirs(out, exist_ok=True)
+                spec = {'out_dir': out, 'init_ckpt': ckpt, 'method': 'bc', 'seed': s, 'steps': 4000, 'lr': 2e-5,
+                        'warmup': 100, 'batch_size': 1024, 'save_at': [250, 1000],
+                        'data': [{'path': EXPERT, 'tasks': 'U', 'first_n': kd}]}
+                import json
+                json.dump(spec, open(f'{out}/train.json', 'w'), indent=1)
+                job.lines.append(f'python -m ktask.train {out}/train.json')
+                for st, ck in ((250, 'step250.ckpt'), (1000, 'step1000.ckpt'), (4000, 'final.ckpt')):
+                    job.lines.append(f'python -m ktask.evaluate {out}/{ck} -o {out}/eval_step{st}.json --tasks UH '
+                                     f'--n {EVAL_N}')
+            jobs.append(job.write())
+    write_manifest('e3x', jobs)
+
+
+@cli.command()
+@click.option('--episodes', default=32768)
+@click.option('--rl_episodes', default=16384)
+def e3r(episodes, rl_episodes):
+    """RL learnability: PPO on the 8 never-seen tasks U (the E1 recipe) from the base, from PPO on the 16 R
+    tasks, and from SFT on clean expert demos of the 16 R tasks."""
+    save_at = [rl_episodes // 8, rl_episodes // 4, rl_episodes // 2, rl_episodes]
+    runs, deps = [], []
+    for s in (0, 1, 2):
+        for name, ckpt, dep in (('base', base_ckpt(s), f'base-s{s}'),
+                                ('ppo_k16', f'{e1_dir(s, 0, 16)}/ppo_ep{episodes}.ckpt', job_of(e1_dir(s, 0, 16))),
+                                ('sft_expert_k16', f'{RUNS}/e2/s{s}/k16/sft_expert/final.ckpt', f'e2-s{s}-k16-sft_expert')):
+            d = f'{RUNS}/e3r/s{s}/{name}'
+            runs.append(((d, ppo_run(d, ckpt, SPLITS['U'], s, rl_episodes, save_at)), dep))
+    jobs = []
+    for (run, dep) in runs:
+        jobs += pack(f'e3r/{os.path.basename(os.path.dirname(run[0]))}/{os.path.basename(run[0])}', [run], 1,
+                     after=[dep], time='04:00:00')
+    write_manifest('e3r', jobs)
+
+
+@cli.command()
+@click.option('--per_task', default=64, help='env slots per task per iteration')
+@click.option('--iterations', default=32)
+def e1p(per_task, iterations):
+    """Equal data per task at equal iteration count: each iteration runs per_task episodes of each of the K
+    tasks (n_envs = per_task * K, minibatch scaled the same way), for the same number of iterations as E1, so
+    every K sees 2,048 episodes per task. K = 16 is E1's K = 16 (1,024 slots = 64 per task)."""
+    jobs = []
+    for s in (1, 2, 0):
+        for c in (0, 1):
+            runs = []
+            for k in (8, 4, 2, 1):
+                n_envs = per_task * k
+                eps = n_envs * iterations
+                d = f'{RUNS}/e1p/s{s}/c{c}/k{k}'
+                runs.append((d, ppo_run(d, base_ckpt(s), chain(s, c)[:k], s, eps,
+                                        [n_envs * i for i in (iterations // 8, iterations // 4, iterations // 2, iterations)],
+                                        n_envs=n_envs, minibatch=max(32, 32 * k))))
+            jobs += pack(f'e1p/s{s}/c{c}', runs, per_job=1, after=[f'base-s{s}'], time='03:00:00')
+    write_manifest('e1p', jobs)
+
+
+@cli.command()
+@click.option('--seeds', default='0,1')
+@click.option('--episodes', default=32768)
+def pilotv2(seeds, episodes):
+    """After the observation-history fix the bases are stronger (~0.70 on all tasks): does PPO still improve
+    the training tasks? K = 16 and K = 1 (chain 0) at lr 3e-6 (E1's) and 1e-5."""
+    save_at = [episodes // 8, episodes // 4, episodes // 2, episodes]
+    jobs = []
+    for s in map(int, seeds.split(',')):
+        runs = []
+        for k in (16, 1):
+            for lr in (3e-6, 1e-5):
+                d = f'{RUNS}/pilotv2/s{s}/k{k}_lr{lr:.0e}'
+                runs.append((d, ppo_run(d, base_ckpt(s), chain(s, 0)[:k], s, episodes, save_at, lr=lr)))
+        jobs += pack(f'pilotv2/s{s}', runs, per_job=1, after=[f'base-s{s}'], time='03:00:00')
+    write_manifest('pilotv2', jobs)
 
 
 if __name__ == '__main__':

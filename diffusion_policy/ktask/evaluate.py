@@ -2,7 +2,8 @@
 Evaluate a checkpoint on a set of tasks (GPU simulation, deterministic flow sampling from seeded noise).
 
 Episode i of task t starts from env seed EVAL_SEED + 1000 t + i, so every checkpoint meets the same start
-states (paired comparisons). An episode ends at its first success or after MAX_STEPS env steps.
+states (paired comparisons). The policy sees the last two env-step observations, as in training (until
+2026-10-14 evening the rollouts here, in ppo.py and collect.py, passed observations 8 steps apart). An episode ends at its first success or after MAX_STEPS env steps.
 Output JSON: {"ckpt", "n", "tasks": {"<t>": {"success": [...], "steps": [...], "lifted": [...]}}}
 (steps: env steps to success, -1 on failure).
 
@@ -33,8 +34,11 @@ def make_env(task_ids):
 
 
 @torch.no_grad()
-def run_batch(env, act_fn, max_steps=MAX_STEPS):
-    """Roll out act_fn(obs_hist (B, 2, 40)) -> actions (B, N_ACT, 10) from the current reset."""
+def run_batch(env, act_fn, max_steps=MAX_STEPS, history='step'):
+    """Roll out act_fn(obs_hist (B, 2, 40)) -> actions (B, N_ACT, 10) from the current reset.
+    history 'step': the two observations are consecutive env steps, as in training (and robomimic's
+    MultiStepWrapper); 'chunk': the previous decision's observation and the current one, 8 steps apart
+    (what every E1-E3 rollout used, by mistake; kept only to reproduce those numbers)."""
     u = env.unwrapped
     n = u.num_envs
     o = u.policy_obs()
@@ -45,7 +49,10 @@ def run_batch(env, act_fn, max_steps=MAX_STEPS):
     t = 0
     while t < max_steps and alive.any():
         actions = act_fn(hist)
+        prev = o
         for j in range(N_ACT):
+            if history == 'step' and j == N_ACT - 1:
+                prev = u.policy_obs()
             _, _, _, _, info = env.step(to_env_action(actions[:, j]))
             t += 1
             new = info['success'] & alive
@@ -55,11 +62,11 @@ def run_batch(env, act_fn, max_steps=MAX_STEPS):
             if t >= max_steps or not alive.any():
                 break
         o = u.policy_obs()
-        hist = torch.stack([hist[:, 1], o], 1)
+        hist = torch.stack([hist[:, 1] if history == 'chunk' else prev, o], 1)
     return steps >= 0, steps, lifted
 
 
-def evaluate(policy, tasks, n, slots, seed=EVAL_SEED, log=print, sigma=0.0):
+def evaluate(policy, tasks, n, slots, seed=EVAL_SEED, log=print, sigma=0.0, history='step'):
     ids = [t for t in tasks for _ in range(slots)]
     env = make_env(ids)
     u = env.unwrapped
@@ -76,7 +83,7 @@ def evaluate(policy, tasks, n, slots, seed=EVAL_SEED, log=print, sigma=0.0):
             act = lambda h: actor.sample(policy.cond(h), gen)[0]
         else:
             act = lambda h: policy.sample(h, gen)
-        succ, steps, lifted = run_batch(env, act)
+        succ, steps, lifted = run_batch(env, act, history=history)
         succ, steps, lifted = succ.cpu().numpy(), steps.cpu().numpy(), lifted.cpu().numpy()
         for i, t in enumerate(ids):
             if b * slots + i % slots < n:
@@ -96,10 +103,11 @@ def evaluate(policy, tasks, n, slots, seed=EVAL_SEED, log=print, sigma=0.0):
 @click.option('--slots', default=32, help='env slots per task')
 @click.option('--seed', default=EVAL_SEED)
 @click.option('--sigma', default=0.0, help="evaluate PPO's stochastic policy (chain noise) instead")
-def main(ckpt, out, tasks, n, slots, seed, sigma):
+@click.option('--history', default='step', type=click.Choice(['chunk', 'step']))
+def main(ckpt, out, tasks, n, slots, seed, sigma, history):
     tasks = parse_tasks(tasks)
     policy, _ = load_checkpoint(ckpt, 'cuda')
-    res = evaluate(policy, tasks, n, min(slots, n), seed, sigma=sigma)
+    res = evaluate(policy, tasks, n, min(slots, n), seed, sigma=sigma, history=history)
     for t in tasks:
         r = res[t]
         print(f"{t:2d} {task_name(t):18s} success {np.mean(r['success']):.2f} lifted {np.mean(r['lifted']):.2f}")

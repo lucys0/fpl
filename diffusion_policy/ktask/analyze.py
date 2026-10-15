@@ -19,6 +19,10 @@ from ktask.env import N_TASKS, task_name
 
 ROOT = '/iris/u/lucyshi/fpl_transfer/ktask'
 RUNS = f'{ROOT}/runs'
+# v2 (default): evaluations and PPO after the observation-history fix; KTASK_VERSION=v1 reproduces the
+# earlier numbers (rollouts with observations 8 steps apart)
+VERSION = os.environ.get('KTASK_VERSION', 'v2')
+SUFFIX = '' if VERSION == 'v1' else VERSION
 
 
 def load_eval(path):
@@ -29,7 +33,7 @@ def load_eval(path):
 
 
 def base_eval(s):
-    return load_eval(f'{RUNS}/base/s{s}/eval.json')
+    return load_eval(f'{RUNS}/base/s{s}/eval{"_" + SUFFIX if SUFFIX else ""}.json')
 
 
 def group_delta(pairs, tasks, metric='success', n_boot=2000, rng=None):
@@ -111,9 +115,9 @@ def pilot(seed):
 def e1_runs(episodes=65536):
     """[(seed, chain, K, run dir, training tasks)] for every E1 run with a ppo.json."""
     out = []
-    for p in sorted(glob.glob(f'{RUNS}/e1/s*/k16*/ppo.json') + glob.glob(f'{RUNS}/e1/s*/c*/k*/ppo.json')):
+    for p in sorted(glob.glob(f'{RUNS}/e1{SUFFIX}/s*/k16*/ppo.json') + glob.glob(f'{RUNS}/e1{SUFFIX}/s*/c*/k*/ppo.json')):
         d = os.path.dirname(p)
-        m = re.search(r'e1/s(\d+)/(?:c(\d+)/)?k(\d+)', d)
+        m = re.search(r'e1(?:v\d)?/s(\d+)/(?:c(\d+)/)?k(\d+)', d)
         spec = json.load(open(p))
         out.append((int(m.group(1)), int(m.group(2)) if m.group(2) else None, int(m.group(3)), d, spec['tasks']))
     return out
@@ -354,6 +358,172 @@ def slopes(out):
     print(text)
     if out:
         open(out, 'w').write(text + '\n')
+
+
+@cli.command()
+@click.option('--out', default=None)
+def per_task(out):
+    """E1 checkpoints regrouped by episodes per task (n / K): at equal data per task, larger K has more
+    iterations (n / 1024) and more total episodes."""
+    from ktask.plot_e1 import mean_delta, train_delta
+    rows = {}
+    for s, c, k, d, train in e1_runs():
+        b = base_eval(s)
+        for n in (4096, 8192, 16384, 32768):
+            e = load_eval(f'{d}/eval_ep{n}.json')
+            if e is None or b is None:
+                continue
+            rows.setdefault((n // k, k), []).append((train_delta(s, c, k, d, train, n, e, b),
+                                                     mean_delta(e, b, SPLITS['H']), mean_delta(e, b, SPLITS['U'])))
+    lines = ['| episodes per task | K | PPO iterations | runs | training tasks | H | U |', '|---|---|---|---|---|---|---|']
+    for (per, k) in sorted(rows, key=lambda x: (-x[0], x[1])):
+        if per < 1024:
+            continue
+        v = np.array(rows[(per, k)])
+        lines.append(f'| {per} | {k} | {per * k // 1024} | {len(v)} | {v[:, 0].mean():+.3f} | {v[:, 1].mean():+.3f} | '
+                     f'{v[:, 2].mean():+.3f} |')
+    text = '\n'.join(lines)
+    print(text)
+    if out:
+        open(out, 'w').write(text + '\n')
+
+
+def _deltas(e, b, train):
+    held = SPLITS['H'] + [t for t in SPLITS['R'] if t not in train]
+    f = lambda ts: float(np.mean([e[t]['success'].mean() - b[t]['success'].mean() for t in ts]))
+    return f(train), f(held), f(SPLITS['U'])
+
+
+@cli.command()
+def e2x():
+    """Filtered-BC diagnosis: for each K = 1 run, training-task and held-out change (10k steps) of BC on
+    different data, next to PPO and the E2 arms."""
+    from ktask.experiments import E2X_RUNS, chain, e1_dir
+    arms = [('PPO (32k episodes)', lambda s, c: f'{e1_dir(s, c, 1)}/eval_ep32768.json'),
+            ("filtered BC, PPO's logged episodes", lambda s, c: f'{RUNS}/e2/s{s}/c{c}/k1/filtered_bc/eval_step10000.json'),
+            ('filtered BC, final PPO, no chain noise', lambda s, c: f'{RUNS}/e2x/s{s}/c{c}/fbc_det/eval_step10000.json'),
+            ('filtered BC, final PPO, chain noise', lambda s, c: f'{RUNS}/e2x/s{s}/c{c}/fbc_sigma/eval_step10000.json'),
+            ("filtered BC, the base's own episodes", lambda s, c: f'{RUNS}/e2x/s{s}/c{c}/fbc_self/eval_step10000.json'),
+            ("filtered BC, logged episodes + replay", lambda s, c: f'{RUNS}/e2x/s{s}/c{c}/fbc_logged_replay/eval_step10000.json'),
+            ('SFT on expert demos', lambda s, c: f'{RUNS}/e2/s{s}/c{c}/k1/sft_expert/eval_step10000.json'),
+            ('SFT on expert demos + replay', lambda s, c: f'{RUNS}/e2x/s{s}/c{c}/sft_expert_replay/eval_step10000.json')]
+    head = ' | '.join(f'{chain(s, c)[0]}: train, held out' for s, c in E2X_RUNS)
+    from ktask.env import task_name
+    print('| arm | ' + ' | '.join(f'{task_name(chain(s, c)[0])} (seed {s}): training, held out' for s, c in E2X_RUNS)
+          + ' | mean training | mean held out |')
+    print('|---' * (len(E2X_RUNS) + 3) + '|')
+    for label, path in arms:
+        cells, tr, ho = [], [], []
+        for s, c in E2X_RUNS:
+            e, b = load_eval(path(s, c)), base_eval(s)
+            if e is None:
+                cells.append('-')
+                continue
+            a, h, _ = _deltas(e, b, [chain(s, c)[0]])
+            cells.append(f'{a:+.2f}, {h:+.2f}')
+            tr.append(a)
+            ho.append(h)
+        m = f'{np.mean(tr):+.3f} | {np.mean(ho):+.3f}' if tr else '- | -'
+        print(f'| {label} | ' + ' | '.join(cells) + f' | {m} |')
+
+
+@cli.command()
+def e3x():
+    """Learnability curves: U success after SFT on k demos per U task for 0 / 250 / 1000 / 4000 steps (lr 2e-5),
+    per start; change vs the base start at the same point."""
+    from ktask.experiments import e1_dir
+    starts = ('base', 'ppo_k1', 'ppo_k4', 'ppo_k16', 'sft_expert_k16')
+    zero = {'base': lambda s: f'{RUNS}/base/s{s}/eval.json',
+            'ppo_k1': lambda s: f'{e1_dir(s, 0, 1)}/eval_ep32768.json',
+            'ppo_k4': lambda s: f'{e1_dir(s, 0, 4)}/eval_ep32768.json',
+            'ppo_k16': lambda s: f'{e1_dir(s, 0, 16)}/eval_ep32768.json',
+            'sft_expert_k16': lambda s: f'{RUNS}/e2/s{s}/k16/sft_expert/eval_step10000.json'}
+    U = SPLITS['U']
+    for kd in (1, 5):
+        print(f'\n### {kd} demo(s) per never-seen task: U success (change vs the base start at the same point)\n')
+        print('| start | 0 steps | 250 | 1000 | 4000 | H after 4000 |')
+        print('|---|---|---|---|---|---|')
+        for st in starts:
+            cells = []
+            for point in (0, 250, 1000, 4000):
+                vals, dv = [], []
+                for s in (0, 1, 2):
+                    if point == 0:
+                        e, eb = load_eval(zero[st](s)), load_eval(zero['base'](s))
+                    else:
+                        e = load_eval(f'{RUNS}/e3x/s{s}/{st}/k{kd}/eval_step{point}.json')
+                        eb = load_eval(f'{RUNS}/e3x/s{s}/base/k{kd}/eval_step{point}.json')
+                    if e is None or eb is None:
+                        continue
+                    vals.append(np.mean([e[t]['success'].mean() for t in U]))
+                    dv.append(np.mean([e[t]['success'].mean() - eb[t]['success'].mean() for t in U]))
+                cells.append(f'{np.mean(vals):.2f} ({np.mean(dv):+.3f}, n={len(vals)})' if vals else '-')
+            hv = []
+            for s in (0, 1, 2):
+                e = load_eval(f'{RUNS}/e3x/s{s}/{st}/k{kd}/eval_step4000.json')
+                if e is not None:
+                    hv.append(np.mean([e[t]['success'].mean() for t in SPLITS['H']]))
+            print(f'| {st} | ' + ' | '.join(cells) + f" | {np.mean(hv):.2f} |" if hv else f'| {st} | ' + ' | '.join(cells) + ' | - |')
+
+
+@cli.command()
+def e3r():
+    """RL learnability: U success during PPO on the 8 U tasks, per start (0 = before RL on U)."""
+    from ktask.experiments import e1_dir
+    zero = {'base': lambda s: f'{RUNS}/base/s{s}/eval.json',
+            'ppo_k16': lambda s: f'{e1_dir(s, 0, 16)}/eval_ep32768.json',
+            'sft_expert_k16': lambda s: f'{RUNS}/e2/s{s}/k16/sft_expert/eval_step10000.json'}
+    U = SPLITS['U']
+    print('| start | 0 episodes | 2048 | 4096 | 8192 | 16384 | H at 16384 |')
+    print('|---|---|---|---|---|---|---|')
+    for st in ('base', 'ppo_k16', 'sft_expert_k16'):
+        cells = []
+        for n in (0, 2048, 4096, 8192, 16384):
+            vals = []
+            for s in (0, 1, 2):
+                e = load_eval(zero[st](s)) if n == 0 else load_eval(f'{RUNS}/e3r/s{s}/{st}/eval_ep{n}.json')
+                if e is not None:
+                    vals.append(np.mean([e[t]['success'].mean() for t in U]))
+            cells.append(f'{np.mean(vals):.2f} (n={len(vals)})' if vals else '-')
+        hv = [np.mean([e[t]['success'].mean() for t in SPLITS['H']]) for s in (0, 1, 2)
+              for e in [load_eval(f'{RUNS}/e3r/s{s}/{st}/eval_ep16384.json')] if e is not None]
+        print(f'| {st} | ' + ' | '.join(cells) + (f' | {np.mean(hv):.2f} |' if hv else ' | - |'))
+
+
+@cli.command()
+def e1p():
+    """Equal data per task (2,048) and equal iterations (32): change at each checkpoint per K; K = 16 is E1."""
+    from ktask.experiments import chain, e1_dir
+    from ktask.plot_e1 import mean_delta
+    print('| K | slots per iteration | runs | iteration 4 (train, H) | 8 | 16 | 32 | U at 32 | H per unit of training change |')
+    print('|---|---|---|---|---|---|---|---|---|')
+    for k in (1, 2, 4, 8, 16):
+        per_it = {4: [], 8: [], 16: [], 32: []}
+        u32, slopes = [], []
+        for s in (0, 1, 2):
+            for c in ((0, 1) if k < 16 else (0, 1)):
+                d = f'{RUNS}/e1p/s{s}/c{c}/k{k}' if k < 16 else e1_dir(s, c, 16)
+                n_envs = 64 * k
+                b = base_eval(s)
+                train = chain(s, c)[:k] if k < 16 else SPLITS['R']
+                xs, ys = [], []
+                for it in (4, 8, 16, 32):
+                    e = load_eval(f'{d}/eval_ep{n_envs * it}.json')
+                    if e is None:
+                        continue
+                    a, h = mean_delta(e, b, train), mean_delta(e, b, SPLITS['H'])
+                    per_it[it].append((a, h))
+                    xs.append(a)
+                    ys.append(h)
+                    if it == 32:
+                        u32.append(mean_delta(e, b, SPLITS['U']))
+                x, y = np.array(xs), np.array(ys)
+                if len(x) == 4 and (x ** 2).sum() > 1e-4:
+                    slopes.append((x * y).sum() / (x ** 2).sum())
+        cells = [f'{np.mean([v[0] for v in per_it[it]]):+.3f}, {np.mean([v[1] for v in per_it[it]]):+.3f}'
+                 if per_it[it] else '-' for it in (4, 8, 16, 32)]
+        print(f'| {k} | {64 * k} | {len(per_it[32])} | ' + ' | '.join(cells) +
+              f" | {np.mean(u32):+.3f} | {np.mean(slopes):.2f} |" if u32 else f'| {k} | {64 * k} | 0 | ' + ' | '.join(cells) + ' | - | - |')
 
 
 @cli.command()

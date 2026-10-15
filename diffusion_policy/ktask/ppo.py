@@ -11,7 +11,9 @@ iterations first collapsed the policy (pilot, 2026-10-14). Reward 1 on success, 
 episode; optional time_cost c subtracts c * (steps / MAX_STEPS) over an episode. Dropout stays off.
 
 Each iteration runs one episode in each of n_envs slots, split evenly over the K tasks, so the K tasks get
-equal shares of the episode budget. Advantages are normalized over the whole batch.
+equal shares of the episode budget. Advantages are normalized over the whole batch. At each decision the
+policy sees the last two env-step observations, as in training (before 2026-10-14 evening: observations 8
+steps apart, which handicapped every BC-trained policy).
 
   python -m ktask.ppo spec.json
   {"out_dir", "init_ckpt", "tasks": [ids], "episodes": 65536, "save_at": [...], "n_envs": 1024,
@@ -172,9 +174,13 @@ def main(spec_path):
             reward = torch.zeros(n_envs, device=device)
             was_alive = alive.clone()
             for j in range(N_ACT):
-                if log_rollouts:
-                    traj_obs.append(u.policy_obs())
-                    traj_act.append(action[:, j])
+                if log_rollouts or j == N_ACT - 1:
+                    cur = u.policy_obs()
+                    if j == N_ACT - 1:
+                        prev = cur                              # the observation before the newest one
+                    if log_rollouts:
+                        traj_obs.append(cur)
+                        traj_act.append(action[:, j])
                 _, _, _, _, info = env.step(to_env_action(action[:, j]))
                 t_env += 1
                 new = info['success'] & alive
@@ -188,7 +194,7 @@ def main(spec_path):
             if not alive.any():
                 break
             o = u.policy_obs()
-            hist = torch.stack([hist[:, 1], o], 1)
+            hist = torch.stack([prev, o], 1)                    # consecutive env steps, as in training
         if log_rollouts:
             obs_all = torch.stack(traj_obs, 1).cpu().numpy()
             act_all = torch.stack(traj_act, 1).cpu().numpy()

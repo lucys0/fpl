@@ -57,7 +57,7 @@ N_OBJ, N_TGT = len(OBJ_NAMES), len(TGT_NAMES)
 N_TASKS = N_OBJ * N_TGT
 OBS_DIM, ACT_DIM = 40, 10
 COLORS = [(0.85, 0.2, 0.2), (0.2, 0.55, 0.85), (0.25, 0.7, 0.3), (0.9, 0.6, 0.1),
-          (0.6, 0.3, 0.75), (0.15, 0.7, 0.7), (0.8, 0.4, 0.55), (0.45, 0.45, 0.45)]
+          (0.6, 0.3, 0.75), (0.15, 0.7, 0.7), (0.8, 0.4, 0.55), (0.6, 0.38, 0.12)]
 
 PLATFORM_HALF = (0.05, 0.05, 0.03)          # top at z = 0.06
 PLATFORM_TOP = 2 * PLATFORM_HALF[2]
@@ -134,8 +134,8 @@ class KTaskPlaceEnv(BaseEnv):
     def _default_human_render_camera_configs(self):
         from mani_skill.sensors.camera import CameraConfig
         from mani_skill.utils import sapien_utils
-        pose = sapien_utils.look_at([0.45, -0.55, 0.45], [-0.05, 0.0, 0.05])
-        return CameraConfig('render_camera', pose, 512, 512, 1, 0.01, 100)
+        pose = sapien_utils.look_at([0.28, -0.48, 0.36], [-0.04, 0.0, 0.04])
+        return CameraConfig('render_camera', pose, 512, 512, 0.9, 0.01, 100)
 
     def _load_agent(self, options):
         super()._load_agent(options, sapien.Pose(p=list(ROBOT_ROOT)))
@@ -211,7 +211,7 @@ class KTaskPlaceEnv(BaseEnv):
                 b.add_box_visual(sapien.Pose(p=p), half_size=hs, material=grey)
         elif kind == 'goal':       # a flat marker, no collision
             b.add_cylinder_visual(sapien.Pose(q=[np.cos(np.pi / 4), 0, np.sin(np.pi / 4), 0]), radius=GOAL_XY_TOL,
-                                  half_length=0.0005, material=sapien.render.RenderMaterial(base_color=[0.2, 0.8, 0.2, 1]))
+                                  half_length=0.002, material=sapien.render.RenderMaterial(base_color=[0.1, 0.9, 0.1, 1]))
         else:                      # air: a small marker, no collision
             b.add_sphere_visual(radius=0.008, material=sapien.render.RenderMaterial(base_color=[0.2, 0.8, 0.2, 1]))
         b.initial_pose = sapien.Pose(p=[0, 0.15, 0.0])

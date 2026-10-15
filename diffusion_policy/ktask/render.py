@@ -58,12 +58,14 @@ def main(out, q, ckpt, steps, seed, size):
             j += 1
         else:
             a = ex.act()
+        if ckpt and j == N_ACT:
+            prev = u.policy_obs()
         _, _, _, _, info = env.step(to_env_action(a))
         s = info['success'].cpu()
         done_at[(done_at < 0) & s] = t
         if ckpt and j == N_ACT:
             o = u.policy_obs()
-            hist = torch.stack([hist[:, 1], o], 1)
+            hist = torch.stack([prev, o], 1)                    # consecutive env steps, as in training
         if t % 2 == 0:
             imgs = env.render().cpu().numpy()                      # (N, H, W, 3)
             tiles = []
