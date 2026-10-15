@@ -1,3 +1,16 @@
+> **Correction (2026-10-14, 23:00): the ManiSkill results below are not valid evidence of transfer.**
+> The rollouts in evaluate.py, ppo.py and collect.py gave the policy two observations 8 env steps apart.
+> In training (and on robosuite) the two observations are consecutive steps.
+>
+> - Every BC-trained policy was therefore evaluated out of distribution. With the correct input, all three
+>   bases score 0.69–0.71, not 0.41–0.62, and the per-seed differences disappear.
+> - PPO learned to cope with the mismatched input. That gain is task-independent, so it transferred to
+>   every task. With the correct input, the PPO checkpoints are no better than their bases (0.63–0.71 vs
+>   0.69–0.72).
+> - E1–E3 below therefore mostly measure that artifact. The robosuite (robomimic) results are unaffected:
+>   its wrapper stacks consecutive steps.
+> - The fix is in commit 53f5876. Corrected experiments are under `runs/*v2`.
+
 # Does RL on K tasks help held-out tasks, and does that change with K? (ManiSkill3, 2026-10-14)
 
 All runs complete:
