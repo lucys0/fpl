@@ -324,6 +324,39 @@ def e3(episodes, out):
 
 
 @cli.command()
+@click.option('--out', default=None)
+def slopes(out):
+    """Held-out change per unit of training-task change: per run, the least-squares slope through the origin
+    over its checkpoints (4k-32k episodes); mean over runs per K with a 95% bootstrap CI over runs."""
+    from ktask.plot_e1 import run_paths
+    paths = run_paths([4096, 8192, 16384, 32768])
+    rng = np.random.RandomState(0)
+    lines = ['| K | runs | H per unit of training change | U per unit of training change | runs with H slope > 0.5 |',
+             '|---|---|---|---|---|']
+    for k in sorted({k for k, _ in paths}):
+        sl = {0: [], 1: []}
+        for kk, p in paths:
+            if kk != k:
+                continue
+            x = np.array([q[0] for q in p])
+            if (x ** 2).sum() < 1e-4:
+                continue
+            for j in (0, 1):
+                y = np.array([q[1 + j] for q in p])
+                sl[j].append(float((x * y).sum() / (x ** 2).sum()))
+        cells = []
+        for j in (0, 1):
+            v = np.array(sl[j])
+            b = [rng.choice(v, len(v)).mean() for _ in range(2000)]
+            cells.append(f'{v.mean():.2f} [{np.percentile(b, 2.5):.2f}, {np.percentile(b, 97.5):.2f}]')
+        lines.append(f'| {k} | {len(sl[0])} | {cells[0]} | {cells[1]} | {np.sum(np.array(sl[0]) > 0.5)}/{len(sl[0])} |')
+    text = '\n'.join(lines)
+    print(text)
+    if out:
+        open(out, 'w').write(text + '\n')
+
+
+@cli.command()
 def e1x():
     """Precise (512-episode) training-task change of each K = 1 run, vs the 128-episode main evaluation."""
     for s, c, k, d, train in e1_runs():
