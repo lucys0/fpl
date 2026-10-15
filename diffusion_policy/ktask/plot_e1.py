@@ -16,7 +16,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
 
-from ktask.analyze import base_eval, e1_runs, load_eval, relation
+from ktask.analyze import RUNS, base_eval, e1_runs, load_eval, relation
 from ktask.data import SPLITS
 
 COLORS = {1: 'tab:blue', 2: 'tab:orange', 4: 'tab:green', 8: 'tab:red', 16: 'tab:purple'}
@@ -38,6 +38,33 @@ def groups(train):
     return out
 
 
+def train_delta(s, c, k, d, train, budget, e, b):
+    """Training-task change; for K = 1 the precise E1x evaluation (512 episodes) when it exists."""
+    if k == 1:
+        x, xb = load_eval(f'{RUNS}/e1x/s{s}/c{c}/ep{budget}.json'), load_eval(f'{RUNS}/e1x/s{s}/c{c}/base.json')
+        if x is not None and xb is not None:
+            t = train[0]
+            return float(x[t]['success'].mean() - xb[t]['success'].mean())
+    return mean_delta(e, b, train)
+
+
+def run_paths(budgets):
+    """[(K, [(d_train, d_H, d_U) per budget])] for runs evaluated at every budget."""
+    out = []
+    for s, c, k, d, train in e1_runs():
+        b = base_eval(s)
+        pts = []
+        for n in budgets:
+            e = load_eval(f'{d}/eval_ep{n}.json')
+            if e is None or b is None:
+                break
+            pts.append((train_delta(s, c, k, d, train, n, e, b), mean_delta(e, b, SPLITS['H']),
+                        mean_delta(e, b, SPLITS['U'])))
+        if len(pts) == len(budgets):
+            out.append((k, pts))
+    return out
+
+
 def summary(budget):
     """{K: [ {group: delta} per run ]} at one budget."""
     out = {}
@@ -45,7 +72,9 @@ def summary(budget):
         e, b = load_eval(f'{d}/eval_ep{budget}.json'), base_eval(s)
         if e is None or b is None:
             continue
-        out.setdefault(k, []).append({g: mean_delta(e, b, ts) for g, ts in groups(train).items()})
+        r = {g: mean_delta(e, b, ts) for g, ts in groups(train).items()}
+        r['train'] = train_delta(s, c, k, d, train, budget, e, b)
+        out.setdefault(k, []).append(r)
     return out
 
 
@@ -60,7 +89,7 @@ def errbar(ax, ks, vals, color='k', label=None):
 
 @click.command()
 @click.option('--budget', default=None, type=int, help='episodes (default: the largest with results)')
-@click.option('--budgets', default='4096,8192,16384,32768,65536')
+@click.option('--budgets', default='4096,8192,16384,32768')
 @click.option('--out', default='/iris/u/lucyshi/fpl_transfer/ktask/results/e1.png')
 def main(budget, budgets, out):
     budgets = [int(b) for b in budgets.split(',')]
@@ -79,21 +108,21 @@ def main(budget, budgets, out):
     ax.legend(fontsize=8)
     ax.set_title('(b) Held-out tasks (in pretraining, never trained with RL)', fontsize=10)
     ax = axes[0, 2]
+    paths = run_paths(budgets)
     for k in ks:
-        pts = []
-        for b in budgets:
-            Sb = summary(b).get(k, [])
-            if Sb:
-                pts.append((np.mean([r['train'] for r in Sb]), np.mean([r['H'] for r in Sb])))
-        if pts:
-            xs, ys = zip(*([(0.0, 0.0)] + pts))
-            ax.plot(xs, ys, '-o', color=COLORS.get(k, 'k'), label=f'K = {k}', ms=4)
+        P = np.array([p for kk, p in paths if kk == k])            # runs x budgets x 3
+        if len(P):
+            xs = [0.0] + list(P[:, :, 0].mean(0))
+            ys = [0.0] + list(P[:, :, 1].mean(0))
+            ax.plot(xs, ys, '-o', color=COLORS.get(k, 'k'), label=f'K = {k} ({len(P)} runs)', ms=4)
+    lim = max(0.05, max([abs(x) for _, p in paths for x, _, _ in p] or [0.1]))
+    ax.plot([0, lim], [0, lim], color='k', lw=0.6, alpha=0.4)
     ax.axhline(0, color='k', lw=0.6)
     ax.axvline(0, color='k', lw=0.6)
     ax.set_xlabel('change on training tasks')
     ax.set_ylabel('change on H')
     ax.legend(fontsize=8)
-    ax.set_title('(c) Held-out vs training change along training\n(points: checkpoints)', fontsize=10)
+    ax.set_title(f'(c) Held-out vs training change along training\n(checkpoints {budgets}; runs with all of them)', fontsize=10)
     ax = axes[1, 0]
     for rel, c in (('object', 'tab:blue'), ('target', 'tab:orange'), ('both', 'tab:green'), ('neither', 'tab:red')):
         vals = [np.array([r[rel] for r in S[k] if not np.isnan(r[rel])]) for k in ks]
@@ -104,8 +133,24 @@ def main(budget, budgets, out):
     ax = axes[1, 1]
     errbar(ax, ks, [np.array([r['U'] for r in S[k]]) for k in ks])
     ax.set_title('(e) Never-seen tasks U (zero-shot)', fontsize=10)
-    axes[1, 2].axis('off')
-    for ax in list(axes[0]) + list(axes[1, :2]):
+    ax = axes[1, 2]
+    for j, (name, color) in enumerate((('H', 'k'), ('U', 'tab:gray'))):
+        vals = []
+        for k in ks:
+            sl = []
+            for kk, p in paths:
+                if kk == k:
+                    x = np.array([q[0] for q in p])
+                    y = np.array([q[1 + j] for q in p])
+                    if (x ** 2).sum() > 1e-4:
+                        sl.append(float((x * y).sum() / (x ** 2).sum()))
+            vals.append(np.array(sl))
+        kk = [k for k, v in zip(ks, vals) if len(v)]
+        errbar(ax, kk, [v for v in vals if len(v)], color=color, label=f'{name} per unit of training change')
+    ax.axhline(1, color='k', lw=0.6, ls=':')
+    ax.legend(fontsize=8)
+    ax.set_title('(f) Transfer per unit of training improvement\n(per-run slope through the origin over checkpoints)', fontsize=10)
+    for ax in list(axes[0]) + list(axes[1]):
         if ax is not axes[0, 2]:
             ax.set_xscale('log', base=2)
             ax.set_xticks([1, 2, 4, 8, 16])

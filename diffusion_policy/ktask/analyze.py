@@ -324,6 +324,27 @@ def e3(episodes, out):
 
 
 @cli.command()
+def e1x():
+    """Precise (512-episode) training-task change of each K = 1 run, vs the 128-episode main evaluation."""
+    for s, c, k, d, train in e1_runs():
+        if k != 1:
+            continue
+        xb = load_eval(f'{RUNS}/e1x/s{s}/c{c}/base.json')
+        if xb is None:
+            continue
+        t = train[0]
+        cells = []
+        for ep in (4096, 8192, 16384, 32768):
+            x = load_eval(f'{RUNS}/e1x/s{s}/c{c}/ep{ep}.json')
+            e, b = load_eval(f'{d}/eval_ep{ep}.json'), base_eval(s)
+            precise = f"{x[t]['success'].mean() - xb[t]['success'].mean():+.3f}" if x else '-'
+            main = f"{e[t]['success'].mean() - b[t]['success'].mean():+.3f}" if e else '-'
+            cells.append(f'{precise} ({main})')
+        print(f"s{s} c{c} {task_name(t):18s} base {xb[t]['success'].mean():.2f}: 4k/8k/16k/32k "
+              + ' '.join(cells) + '   [512 episodes (128-episode main eval)]')
+
+
+@cli.command()
 @click.option('--seed', default=0)
 def base(seed):
     b = base_eval(seed)

@@ -194,6 +194,29 @@ def e2(seeds, episodes, lr):
     write_manifest(f"e2_s{seeds.replace(',', '')}", jobs)
 
 
+@cli.command()
+@click.option('--seeds', default='1,2,0')
+@click.option('--chains', default=4)
+@click.option('--n', default=512)
+def e1x(seeds, chains, n):
+    """Precise training-task evaluation for K = 1 runs (one task, so 128 episodes are noisy): the task with
+    n episodes (seeds from 400000) for the base and each checkpoint, paired on start states."""
+    jobs = []
+    for s in map(int, seeds.split(',')):
+        for c in range(chains):
+            d = e1_dir(s, c, 1)
+            task = chain(s, c)[0]
+            job = Job(f'e1x/s{s}/c{c}', after=[job_of(d)], time='01:00:00')
+            out = job.dir
+            job.lines.append(f'python -m ktask.evaluate {base_ckpt(s)} -o {out}/base.json --tasks {task} --n {n} '
+                             f'--slots {n} --seed 400000')
+            for ep in (4096, 8192, 16384, 32768):
+                job.lines.append(f'python -m ktask.evaluate {d}/ppo_ep{ep}.ckpt -o {out}/ep{ep}.json --tasks {task} '
+                                 f'--n {n} --slots {n} --seed 400000')
+            jobs.append(job.write())
+    write_manifest('e1x', jobs)
+
+
 LEARN_KS = (5, 20)
 LEARN_STEPS = 2000
 

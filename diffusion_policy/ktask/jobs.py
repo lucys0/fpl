@@ -25,6 +25,9 @@ PY = f'{I}/maniskill/.venv/bin/python'
 # iris4: small GPUs. iris[1-3] (TITAN RTX) and iris-hp-z8 (RTX 8000): PPO iterations 3-7 min vs ~1 min on
 # L40S/H100 (2026-10-14), so a 64-iteration run can exceed the time limit
 EXCLUDE = 'iris[1-4],iris-hp-z8'
+# sc-freegpu (no per-user cap): only the TITAN X / Xp nodes that mount /iris (macondo1-2, deep25); the 8 GB
+# 1070 nodes and the nodes without /iris are excluded
+FREE_EXCLUDE = 'deep[17-24],dawn[1-18],orion-dgx,britten[1-2],charlotte,macondo-dgx1,visionlab-dgx1'
 
 WRAPPER = f'''#!/bin/bash
 #SBATCH --account=iris
@@ -116,10 +119,11 @@ def done(d):
     return os.path.exists(f'{d}/DONE')
 
 
-def submit(manifests, max_iris, max_hi, dry):
+def submit(manifests, max_iris, max_hi, dry, max_free=0):
     q = queued()
     n_hi = sum(1 for p in q.values() if p == 'iris-hi')
     n_iris = sum(1 for p in q.values() if p == 'iris')
+    n_free = sum(1 for p in q.values() if p == 'sc-freegpu')
     jobs, dirs = [], {}
     for m in expand(manifests):
         for j in json.load(open(m)):
@@ -137,14 +141,17 @@ def submit(manifests, max_iris, max_hi, dry):
             part, n_hi = 'iris-hi', n_hi + 1
         elif n_iris < max_iris:
             part, n_iris = 'iris', n_iris + 1
+        elif n_free < max_free:
+            part, n_free = 'sc-freegpu', n_free + 1
         else:
             break
         snap = snapshot(m)
         wrapper = f"{os.path.dirname(m)}/.wrapper_{os.path.basename(snap)}.sh"
         if not os.path.exists(wrapper):
             open(wrapper, 'w').write(WRAPPER.replace('SNAPSHOT', snap))
+        where = f"--exclude={FREE_EXCLUDE if part == 'sc-freegpu' else EXCLUDE}"
         cmd = ['sbatch', f'--partition={part}', f"--job-name={j['name']}", f"--time={j.get('time', '04:00:00')}",
-               f'--exclude={EXCLUDE}', f"--output={j['dir']}/slurm-%j.out", wrapper, j['dir']]
+               where, f"--output={j['dir']}/slurm-%j.out", wrapper, j['dir']]
         if dry:
             print(' '.join(cmd))
             continue
@@ -179,10 +186,11 @@ if __name__ == '__main__':
     ap.add_argument('manifests', nargs='+')
     ap.add_argument('--max_iris', type=int, default=18)
     ap.add_argument('--max_hi', type=int, default=5)
+    ap.add_argument('--max_free', type=int, default=0, help='sc-freegpu jobs (TITAN X/Xp nodes)')
     ap.add_argument('--dry', action='store_true')
     a = ap.parse_args()
     if a.cmd == 'submit':
-        n = submit(a.manifests, a.max_iris, a.max_hi, a.dry)
+        n = submit(a.manifests, a.max_iris, a.max_hi, a.dry, a.max_free)
         print(f'{time.strftime("%H:%M")} submitted {n}')
     else:
         status(a.manifests)
